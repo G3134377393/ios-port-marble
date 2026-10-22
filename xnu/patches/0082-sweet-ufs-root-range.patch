@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -496,7 +496,19 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++	if (!error) {
++		uint32_t lba = 0, nblocks = 0;
++		if (PE_parse_boot_argn("ufsroot_lba", &lba, sizeof(lba)) &&
++		    PE_parse_boot_argn("ufsroot_blocks", &nblocks, sizeof(nblocks)) &&
++		    lba >= su.first_block &&
++		    (uint64_t)lba + nblocks <= su.first_block + su.nblocks) {
++			printf("SWEET UFS: root range override 0x%x + %u blocks\n",
++			    lba, nblocks);
++			su.first_block = lba;
++			su.nblocks = nblocks;
++		}
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;

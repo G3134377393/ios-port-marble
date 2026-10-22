@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -496,7 +496,19 @@ sweet_ufs_init(void)
+@@ -663,6 +663,18 @@ sweet_ufs_init(void)
  	if (!error) {
  		error = ufs_find_partition(want);
  	}

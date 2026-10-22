@@ -1,0 +1,80 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-10-23 00:49:11
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-10-23 00:49:11
+@@ -881,4 +881,63 @@
+ 	*targetP = this;
+ 	return &sweet_surface_traps[index];
+ }
++
++/*
++ * Minimal AppleMobileFileIntegrity IOKit service. launchd_cache_loader,
++ * which launchd spawns as a panic-on-exit boot task, finds this service with
++ * IOServiceMatching("AppleMobileFileIntegrity"), opens a type-0 user client
++ * and calls selector 6 with a cdhash string; a zero return means "trusted".
++ * Signature policy is handled by the SWEET AMFI MACF layer, so every cdhash
++ * is accepted here.
++ */
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity service registered\n");
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++bool
++AppleMobileFileIntegrityUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	return IOUserClient::initWithTask(owningTask, securityID, type);
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
++    __unused OSObject *target, __unused void *reference)
++{
++	(void)args;
++	if (selector == 6) {
++		return kIOReturnSuccess;	/* cdhash is trusted */
++	}
++	return kIOReturnUnsupported;
++}
+ #endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp	2026-10-23 00:49:11
++++ b/iokit/KernelConfigTables.cpp	2026-10-23 00:49:11
+@@ -63,6 +63,11 @@
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleMobileFileIntegrity;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"

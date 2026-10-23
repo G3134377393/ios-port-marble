@@ -1,0 +1,122 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,6 +1,6 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
++ * marble: PMK8350 PON (power/resin) + PM8350 GPIO6 (volume-up).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -18,15 +18,20 @@
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c400000u
++#define KEYS_CORE_SIZE   0x3000u
+ #define KEYS_OBS_PA      0x0c440000u
+ #define KEYS_CNFG_PA     0x0c42d000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_GPIO_RT     0x8d10u    /* PM8350 GPIO6 status */
++#define KEYS_GPIO_MODE   0x8d40u
++#define KEYS_GPIO_EN     0x8d46u
++#define KEYS_GPIO_SUB    0x8d05u
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
++static bool keys_v7;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
+@@ -42,13 +47,16 @@
+ static uint16_t
+ keys_find_apid(uint16_t ppid, uint32_t count)
+ {
++	/* v5: map 0x900, owner 0x700. v7: map 0x2000, owner 0x0. */
++	uint32_t map_base = keys_v7 ? 0x2000u : 0x900u;
++	uint32_t own_base = keys_v7 ? 0x0u : 0x700u;
+ 	uint16_t found = KEYS_NO_APID;
+ 	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++		uint32_t map = keys_rd(keys_core, map_base + 4u * i);
+ 		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+-		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
++		uint32_t owner = keys_rd(keys_cnfg, own_base + 4u * i) & 7u;
+ 		if (found == KEYS_NO_APID || owner == 0) {
+ 			found = (uint16_t)i;
+ 		}
+@@ -62,7 +70,8 @@
+ 	if (apid == KEYS_NO_APID) {
+ 		return false;
+ 	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
++	/* v5: obs stride 0x80; v7: 0x20 per APID, EE0 at offset 0. */
++	uint32_t off = (keys_v7 ? 0x20u : 0x80u) * apid;
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+@@ -113,7 +122,7 @@
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio6:8d10=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -136,8 +145,8 @@
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
++	keys_core = ml_io_map(KEYS_CORE_PA, KEYS_CORE_SIZE);
++	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x4000);
+ 	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+ 	if (!keys_core || !keys_cnfg || !keys_obs) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+@@ -145,28 +154,31 @@
+ 	}
+ 	keys_version = keys_rd(keys_core, 0);
+ 	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
++	keys_v7 = keys_version >= 0x70000000u && keys_version < 0x80000000u;
++	if ((!keys_v7 && (keys_version < 0x50000000u || keys_version >= 0x70000000u)) ||
++	    count == 0 || count > 1024) {
+ 		printf("SWEET KEYS: unsupported arbiter version=%#x apids=%u\n",
+ 		    keys_version, count);
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	/* marble volume-up: PM8350 SID1 GPIO6 at 0x8d10 -> PPID 0x18d */
++	keys_gpio_apid = keys_find_apid(0x18d, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_MODE, &mode);
++	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_EN, &en);
++	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_SUB, &subtype);
++	printf("SWEET KEYS: arb=%#x%s apids=%u pon-apid=%u gpio6-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    keys_version, keys_v7 ? " v7" : "",
++	    count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: GPIO6 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {

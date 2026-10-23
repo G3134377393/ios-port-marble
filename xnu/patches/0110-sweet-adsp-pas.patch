@@ -743,7 +743,7 @@
 +/* SCM calls follow the Linux qcom_scm a6 resume protocol. */
 --- /dev/null
 +++ b/bsd/dev/sweet_glink.c
-@@ -0,0 +1,1033 @@
+@@ -0,0 +1,1072 @@
 +/*
 + * SWEET: minimal GLINK-over-SMEM client for the ADSP GPR router.
 + *
@@ -814,7 +814,7 @@
 +#define GLINK_FEATURE_REUSE     1u      /* GLINK_FEATURE_INTENT_REUSE */
 +
 +#define G_LINK_NAME             "adsp_apps"
-+#define G_LINK_NAME_LEN         11u
++#define G_LINK_NAME_LEN         10u     /* "adsp_apps" + NUL */
 +
 +#define G_NINTENTS              8
 +#define G_INTENT_SIZE           1024u
@@ -1185,7 +1185,7 @@
 +		g_fifo_read(g_rx_off, g_rx_len, tail + 8, tmp, n);
 +		tmp[n] = 0;
 +		printf("SWEET GLINK: remote OPEN rcid=%u name=%s\n", p1, tmp);
-+		if (n == G_LINK_NAME_LEN &&
++		if (n >= 9 &&
 +		    tmp[0] == 'a' && tmp[1] == 'd' && tmp[2] == 's' &&
 +		    tmp[3] == 'p' && tmp[4] == '_' && tmp[5] == 'a' &&
 +		    tmp[6] == 'p' && tmp[7] == 'p' && tmp[8] == 's') {
@@ -1398,7 +1398,7 @@
 +	if (g_pick_riid(len) == NULL) {
 +		printf("SWEET GLINK: requesting %u-byte intent\n", len);
 +		g_send(CMD_RX_INTENT_REQ, (uint16_t)g_lcid, len, NULL, 0);
-+		if (!g_wait_riid(len, 2000)) {
++		if (!g_wait_riid(len, 5000)) {
 +			printf("SWEET GLINK: no remote intent for %u bytes "
 +			    "(rx_avail=%u)\n", len, g_rx_avail());
 +			return;
@@ -1453,6 +1453,27 @@
 +
 +	printf("SWEET GLINK: PRM vote lpass core (%u bytes)\n", pkt_size);
 +	g_send_gpr(pkt, pkt_size);
++}
++
++/* APM_CMD_GET_SPF_STATE on the spf_core service: proves APM is alive even
++ * if the PRM vote is refused.  src_port and dest_port are both 1. */
++static void
++g_apm_state_query(void)
++{
++	uint8_t pkt[32];
++	uint32_t n = 24;
++
++	for (uint32_t i = 0; i < sizeof(pkt); i++) {
++		pkt[i] = 0;
++	}
++	g_put32(pkt + 0, (6u << 4) | (n << 8));
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
++	g_put32(pkt + 8, 1);
++	g_put32(pkt + 12, 1);
++	g_put32(pkt + 16, 2);
++	g_put32(pkt + 20, 0x01001021u);         /* APM_CMD_GET_SPF_STATE */
++	printf("SWEET GLINK: APM get_spf_state\n");
++	g_send_gpr(pkt, n);
 +}
 +
 +static void
@@ -1768,6 +1789,24 @@
 +		}
 +	} else {
 +		printf("SWEET GLINK: no PRM response\n");
++	}
++	g_drain(100);
++
++	/* Second opinion: ask the APM core for its state. */
++	g_rsp_ready = 0;
++	g_rsp_len = 0;
++	g_apm_state_query();
++	for (unsigned i = 0; i < 3000; i += 5) {
++		g_drain(0);
++		if (g_rsp_ready) {
++			break;
++		}
++		g_wait(5);
++	}
++	if (g_rsp_ready) {
++		g_dump("APM response", g_rsp, g_rsp_len);
++	} else {
++		printf("SWEET GLINK: no APM response\n");
 +	}
 +	g_drain(100);
 +

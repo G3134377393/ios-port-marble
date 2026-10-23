@@ -1,0 +1,733 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,5 +112,6 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_audio.c			standard
++bsd/dev/sweet_adsp.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern void sweet_touch_init(void);
+ extern void marble_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_audio_probe(void);
++extern void sweet_adsp_init(void);
+ 
+ #define REG_CAP         0x00
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -705,6 +705,7 @@
+ 	sweet_touch_init();
+ 	marble_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_audio_probe();
++	sweet_adsp_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_adsp.c
+@@ -0,0 +1,701 @@
++/*
++ * SWEET: minimal ADSP (Q6) bring-up for marble.
++ *
++ * LPASS has no AP-side clock controller: the audio macros, the SoundWire
++ * masters and the LPASS AG NoC only come alive after the ADSP firmware has
++ * run.  The TZ exposes the PIL/PAS SCM calls to the AP (verified with
++ * sweetscm=1 on 2026-10-23), so this driver loads the stock signed adsp2.mdt
++ * image into the reserved adsp_region and asks TZ to authenticate and
++ * release the Q6:
++ *
++ *   pas_init_image(1, metadata)   metadata = ELF header+phdrs + hash (b26)
++ *   pas_mem_setup(1, 0x9fd00000, 0x3100000)
++ *   copy the PT_LOAD segments to the region (rebased from ELF min p_paddr)
++ *   pas_auth_and_reset(1)
++ *
++ * The firmware files are packed by tools/mkfwblob.py into the payload's
++ * RAMDisk slot (the shim already reports it as /chosen/memory-map/RAMDisk),
++ * so the kernel needs no filesystem access to reach them.
++ *
++ * Everything is gated by sweetadsp=1; no SCM call is made otherwise.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
++#include <arm/memory_types.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start,
++    vm_offset_t end, vm_prot_t prot, unsigned int flags);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_adsp_init(void);
++
++#define PAS_ID          1
++#define ADSP_REGION_PA  0x9fd00000u     /* live DT adsp_region@9fd00000 */
++#define ADSP_REGION_SZ  0x03100000u     /* 49 MiB */
++#define ADSP_NOC_PA     0x03c40000u     /* LPASS AG NoC: aborts unless sweetnoc=1 */
++#define LPASS_RX_PA     0x03200000u     /* RX macro: first block Linux touches */
++
++#define CHUNK           (256u * 1024u)
++#define PFN_MASK        0x3fffu
++
++/* Firmware blob written by tools/mkfwblob.py into the RAMDisk slot. */
++struct fw_hdr {
++	char     magic[8];              /* "SWEETFW1" */
++	uint32_t version;
++	uint32_t count;
++	uint32_t entries_off;
++	uint32_t reserved;
++};
++
++struct fw_entry {
++	char     name[32];
++	uint32_t off;
++	uint32_t size;
++};
++
++struct elf32_ehdr {
++	uint8_t  ident[16];
++	uint16_t type;
++	uint16_t machine;
++	uint32_t version;
++	uint32_t entry;
++	uint32_t phoff;
++	uint32_t shoff;
++	uint32_t flags;
++	uint16_t ehsize;
++	uint16_t phentsize;
++	uint16_t phnum;
++	uint16_t shentsize;
++	uint16_t shnum;
++	uint16_t shstrndx;
++} __attribute__((packed));
++
++struct elf32_phdr {
++	uint32_t type;
++	uint32_t offset;
++	uint32_t vaddr;
++	uint32_t paddr;
++	uint32_t filesz;
++	uint32_t memsz;
++	uint32_t flags;
++	uint32_t align;
++} __attribute__((packed));
++
++#define PT_LOAD         1u
++#define MDT_TYPE_MASK   0x07000000u
++#define MDT_TYPE_HASH   0x02000000u
++#define MDT_RELOCATABLE 0x08000000u
++
++static int sweet_adsp_chan;
++
++static void
++sa_wait(unsigned ms)
++{
++	uint64_t deadline;
++
++	if (ms == 0) {
++		return;
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sweet_adsp_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * SCM call.  Standard (interruptible) SMCs may return x0 = 1, meaning the
++ * call was interrupted; TZ then expects a resume with function id 1 and the
++ * continuation token in x6 (a6).  This is what Linux's ARM_SMCCC_QUIRK_QCOM_A6
++ * retry loop does, and skipping it wedges the secure monitor.
++ */
++#define QCOM_SCM_INTERRUPTED    1ull
++#define QCOM_SCM_V2_EBUSY       ((uint64_t)-12)
++
++static uint64_t
++sa_scm_do(uint64_t fnid, uint32_t arginfo,
++    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++    uint64_t *a6, uint64_t *r1, uint64_t *r2)
++{
++	register uint64_t x0 __asm__("x0") = fnid;
++	register uint64_t x1 __asm__("x1") = arginfo;
++	register uint64_t x2 __asm__("x2") = a0;
++	register uint64_t x3 __asm__("x3") = a1;
++	register uint64_t x4 __asm__("x4") = a2;
++	register uint64_t x5 __asm__("x5") = a3;
++	register uint64_t x6 __asm__("x6") = *a6;
++	register uint64_t x7 __asm__("x7") = 0;
++
++	/* Make the firmware/metadata writes visible to TZ before the call. */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5),
++	      "+r"(x6), "+r"(x7)
++	    :
++	    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	      "x16", "x17", "memory");
++	*a6 = x6;
++	if (r1 != NULL) {
++		*r1 = x1;
++	}
++	if (r2 != NULL) {
++		*r2 = x2;
++	}
++	return x0;
++}
++
++static uint64_t
++sa_scm_retry(uint32_t svc, uint32_t cmd, uint32_t arginfo,
++    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++    uint64_t *r1, uint64_t *r2)
++{
++	uint64_t fnid = 0xC2000000ull | ((uint64_t)(svc & 0xff) << 8) |
++	    (cmd & 0xff);
++	uint64_t a6 = 0;
++	uint64_t ret;
++	unsigned tries = 0;
++
++	for (;;) {
++		ret = sa_scm_do(fnid, arginfo, a0, a1, a2, a3, &a6, r1, r2);
++		if (ret == QCOM_SCM_INTERRUPTED) {
++			/* Resume: function id 1, token back in a6. */
++			fnid = 1;
++			if (++tries >= 4000) {
++				break;
++			}
++			continue;
++		}
++		if (ret == QCOM_SCM_V2_EBUSY) {
++			if (++tries >= 4000) {
++				break;
++			}
++			sa_wait(5);
++			continue;
++		}
++		break;
++	}
++	if (tries != 0) {
++		printf("SWEET ADSP: scm %u/%u resumed %u times\n",
++		    svc, cmd, tries);
++	}
++	return ret;
++}
++
++static void
++sa_scm_print(const char *name, uint64_t ret, uint64_t r1, uint64_t r2)
++{
++	printf("SWEET ADSP: %s -> 0x%llx (r1=0x%llx r2=0x%llx)\n",
++	    name, (unsigned long long)ret,
++	    (unsigned long long)r1, (unsigned long long)r2);
++}
++
++/* Copy from a device mapping into normal memory.  XNU's memcpy uses 32-byte
++ * ldp/stp loads that fault on unaligned Device memory, so read byte-wise.
++ */
++static void
++sa_read_dev(void *dst, vm_offset_t src, uint32_t len)
++{
++	volatile uint8_t *s = (volatile uint8_t *)src;
++	uint8_t *d = (uint8_t *)dst;
++
++	for (uint32_t i = 0; i < len; i++) {
++		d[i] = s[i];
++	}
++}
++
++/* Copy through two device mappings.  Unaligned accesses to Device memory
++ * fault on arm64, so move whole 4-byte words and finish byte-wise.
++ */
++static void
++sa_copy_dev(vm_offset_t dst, vm_offset_t src, uint32_t len)
++{
++	volatile uint32_t *d = (volatile uint32_t *)dst;
++	volatile uint32_t *s = (volatile uint32_t *)src;
++	uint32_t n = len >> 2;
++
++	for (uint32_t i = 0; i < n; i++) {
++		d[i] = s[i];
++	}
++	for (uint32_t i = n << 2; i < len; i++) {
++		((volatile uint8_t *)dst)[i] = ((volatile uint8_t *)src)[i];
++	}
++}
++
++/*
++ * Physical-memory windows.
++ *
++ * ml_io_map() takes its VA from a permanent 8 MiB io_submap, and
++ * ml_io_unmap() releases through kernel_map -- which panics when it tries to
++ * split that permanent entry (vm_map_delete: Attempting to remove permanent
++ * VM map entry).  The ADSP region is 49 MiB, larger than the whole submap
++ * anyway, so use our own windows: allocate a kernel_map range and re-point it
++ * with pmap_map() as we walk through physical memory.
++ */
++#define SA_WIN          (1u << 20)      /* bytes copied per window */
++
++static vm_offset_t
++sa_win_alloc(vm_size_t size)
++{
++	vm_offset_t va = 0;
++
++	if (kmem_alloc(kernel_map, &va, size, KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	return va;
++}
++
++/* Map size bytes at physical pa into the window; returns the VA of pa. */
++static vm_offset_t
++sa_win_map(vm_offset_t win, uint64_t pa, vm_size_t size)
++{
++	uint64_t base = pa & ~(uint64_t)PFN_MASK;
++	uint32_t off = (uint32_t)(pa - base);
++	vm_size_t span = (off + size + PFN_MASK) & ~PFN_MASK;
++
++	pmap_remove(kernel_pmap, win, win + span);
++	pmap_map(win, (vm_offset_t)base, (vm_offset_t)(base + span),
++	    VM_PROT_READ | VM_PROT_WRITE, VM_WIMG_IO);
++	return win + off;
++}
++
++static void
++sa_win_free(vm_offset_t win, vm_size_t size)
++{
++	pmap_remove(kernel_pmap, win, win + size);
++	kmem_free(kernel_map, win, size);
++}
++
++/* Copy len bytes between two physical ranges through window mappings. */
++static int
++sa_copy_phys(uint64_t dst, uint64_t src, uint32_t len)
++{
++	vm_size_t wsz = SA_WIN + PAGE_SIZE;
++	vm_offset_t vs, vd;
++
++	vs = sa_win_alloc(wsz);
++	vd = sa_win_alloc(wsz);
++	if (vs == 0 || vd == 0) {
++		printf("SWEET ADSP: no VA for copy windows\n");
++		if (vs != 0) {
++			sa_win_free(vs, wsz);
++		}
++		if (vd != 0) {
++			sa_win_free(vd, wsz);
++		}
++		return EIO;
++	}
++	for (uint32_t done = 0; done < len; ) {
++		uint32_t n = len - done;
++		vm_offset_t s, d;
++
++		if (n > SA_WIN) {
++			n = SA_WIN;
++		}
++		s = sa_win_map(vs, src + done, n);
++		d = sa_win_map(vd, dst + done, n);
++		sa_copy_dev(d, s, n);
++		done += n;
++	}
++	sa_win_free(vs, wsz);
++	sa_win_free(vd, wsz);
++	return 0;
++}
++
++static int
++sa_zero_phys(uint64_t dst, uint32_t len)
++{
++	vm_size_t wsz = SA_WIN + PAGE_SIZE;
++	vm_offset_t vd;
++
++	vd = sa_win_alloc(wsz);
++	if (vd == 0) {
++		return EIO;
++	}
++	for (uint32_t done = 0; done < len; ) {
++		uint32_t n = len - done;
++		vm_offset_t p;
++
++		if (n > SA_WIN) {
++			n = SA_WIN;
++		}
++		p = sa_win_map(vd, dst + done, n);
++		/* No memset here: XNU's bzero uses cache-line zeroing, which
++		 * alignment-faults on Device memory.  Store words instead.
++		 */
++		{
++			volatile uint32_t *z = (volatile uint32_t *)p;
++			uint32_t words = n >> 2;
++
++			for (uint32_t i = 0; i < words; i++) {
++				z[i] = 0;
++			}
++			for (uint32_t i = words << 2; i < n; i++) {
++				((volatile uint8_t *)p)[i] = 0;
++			}
++		}
++		done += n;
++	}
++	sa_win_free(vd, wsz);
++	return 0;
++}
++
++/* Read want bytes from physical pa into a normal kernel buffer. */
++static int
++sa_read_phys(void *dst, uint64_t pa, uint32_t want)
++{
++	vm_size_t wsz = 0x8000;
++	vm_offset_t win;
++	uint8_t *d = dst;
++
++	win = sa_win_alloc(wsz);
++	if (win == 0) {
++		return EIO;
++	}
++	for (uint32_t done = 0; done < want; ) {
++		uint32_t n = want - done;
++		vm_offset_t p;
++
++		if (n > 0x4000) {
++			n = 0x4000;
++		}
++		p = sa_win_map(win, pa + done, n);
++		sa_read_dev(d + done, p, n);
++		done += n;
++	}
++	sa_win_free(win, wsz);
++	return 0;
++}
++
++static void
++sweet_adsp_thread(void *arg, wait_result_t result)
++{
++	int enabled = 0;
++	uint64_t blob_pa = 0, blob_size = 0;
++	DTEntry mmap_entry;
++	const void *prop = NULL;
++	unsigned int prop_len = 0;
++	struct fw_hdr hdr;
++	struct elf32_ehdr ehdr;
++	struct elf32_phdr phdrs[32];
++	struct fw_entry entries[64];
++	char name[32];
++	uint32_t min_addr = 0xffffffffu, max_addr = 0;
++	uint32_t ehdr_size, hash_size;
++	int md_off = -1, hash_off = -1;
++	uint64_t ret, r1 = 0, r2 = 0;
++	vm_offset_t md_va = 0;
++	uint64_t md_pa = 0;
++	int err = 0;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweetadsp", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET ADSP: disabled (sweetadsp=1)\n");
++		goto out;
++	}
++
++	printf("SWEET ADSP: ===== Q6 bring-up, start in 60s =====\n");
++	sa_wait(60000);
++
++	/* 1. Locate the firmware blob in /chosen/memory-map/RAMDisk. */
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mmap_entry) != kSuccess ||
++	    SecureDTGetProperty(mmap_entry, "RAMDisk", &prop, &prop_len) != kSuccess ||
++	    prop_len < 16) {
++		printf("SWEET ADSP: no RAMDisk firmware blob\n");
++		goto out;
++	}
++	blob_pa = ((const uint64_t *)prop)[0];
++	blob_size = ((const uint64_t *)prop)[1];
++	printf("SWEET ADSP: firmware blob at %#llx size %#llx\n",
++	    (unsigned long long)blob_pa, (unsigned long long)blob_size);
++	/* The shim copied the payload with the MMU and caches off, so the
++	 * blob is already in DRAM; we read it through uncached IO maps.
++	 */
++
++	/* 2. Parse the container header and its entries. */
++	{
++		if (sa_read_phys(&hdr, blob_pa, sizeof(hdr)) != 0) {
++			goto out;
++		}
++		if (memcmp(hdr.magic, "SWEETFW1", 8) != 0 || hdr.count == 0 ||
++		    hdr.count > 64 || hdr.entries_off > 0x4000) {
++			printf("SWEET ADSP: bad blob magic %02x%02x%02x%02x%02x%02x%02x%02x\n",
++			    (unsigned)hdr.magic[0], (unsigned)hdr.magic[1],
++			    (unsigned)hdr.magic[2], (unsigned)hdr.magic[3],
++			    (unsigned)hdr.magic[4], (unsigned)hdr.magic[5],
++			    (unsigned)hdr.magic[6], (unsigned)hdr.magic[7]);
++			goto out;
++		}
++		if (sa_read_phys(entries, blob_pa + hdr.entries_off,
++		    hdr.count * sizeof(struct fw_entry)) != 0) {
++			goto out;
++		}
++	}
++
++	/* 3. adsp2.mdt header + program headers. */
++	for (uint32_t i = 0; i < hdr.count; i++) {
++		if (strncmp(entries[i].name, "adsp2.mdt", 32) == 0) {
++			md_off = (int)i;
++		}
++	}
++	if (md_off < 0) {
++		printf("SWEET ADSP: adsp2.mdt missing from blob\n");
++		goto out;
++	}
++	err = sa_read_phys(&ehdr, blob_pa + entries[md_off].off, sizeof(ehdr));
++	if (err) {
++		goto out;
++	}
++	if (memcmp(ehdr.ident, "\x7f" "ELF", 4) != 0 || ehdr.phnum == 0 ||
++	    ehdr.phnum > 32 || ehdr.phentsize != sizeof(struct elf32_phdr)) {
++		printf("SWEET ADSP: bad MDT (magic %02x%02x%02x%02x phnum %u)\n",
++		    (unsigned)ehdr.ident[0], (unsigned)ehdr.ident[1],
++		    (unsigned)ehdr.ident[2], (unsigned)ehdr.ident[3],
++		    (unsigned)ehdr.phnum);
++		goto out;
++	}
++	if (sa_read_phys(phdrs,
++	    blob_pa + entries[md_off].off + ehdr.phoff,
++	    ehdr.phnum * sizeof(struct elf32_phdr)) != 0) {
++		goto out;
++	}
++	printf("SWEET ADSP: MDT phnum=%u entry=%#x\n",
++	    (unsigned)ehdr.phnum, ehdr.entry);
++
++	for (unsigned i = 0; i < ehdr.phnum; i++) {
++		struct elf32_phdr *p = &phdrs[i];
++
++		if (p->type != PT_LOAD ||
++		    (p->flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || !p->memsz) {
++			continue;
++		}
++		printf("SWEET ADSP:   seg %2u paddr=%#x filesz=%#x memsz=%#x flags=%#x\n",
++		    i, p->paddr, p->filesz, p->memsz, p->flags);
++		if (p->paddr < min_addr) {
++			min_addr = p->paddr;
++		}
++		if (p->paddr + p->memsz > max_addr) {
++			max_addr = (p->paddr + p->memsz + PFN_MASK) & ~(uint64_t)PFN_MASK;
++		}
++	}
++	if (max_addr <= min_addr) {
++		printf("SWEET ADSP: empty segment table\n");
++		goto out;
++	}
++	printf("SWEET ADSP: image %#x..%#x (%u MiB), region %#x+%u\n",
++	    min_addr, max_addr, (max_addr - min_addr) >> 20,
++	    ADSP_REGION_PA, ADSP_REGION_SZ);
++	if (max_addr - min_addr > ADSP_REGION_SZ) {
++		printf("SWEET ADSP: image does not fit the region\n");
++		goto out;
++	}
++
++	/* 4. Metadata = MDT ELF header+phdrs followed by the hash segment.
++	 *    The hash is program header 26 (type 0, flags & TYPE_MASK == HASH)
++	 *    and lives in the split file adsp2.b26, not adsp2.b00.
++	 */
++	{
++		int hash_idx = -1;
++
++		for (unsigned i = 1; i < ehdr.phnum; i++) {
++			if (phdrs[i].type != PT_LOAD &&
++			    (phdrs[i].flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++				hash_idx = (int)i;
++				break;
++			}
++		}
++		if (hash_idx < 0) {
++			printf("SWEET ADSP: no hash segment in MDT\n");
++			goto out;
++		}
++		ehdr_size = phdrs[0].filesz;
++		hash_size = phdrs[hash_idx].filesz;
++		if (entries[md_off].size < ehdr_size) {
++			printf("SWEET ADSP: MDT too small for its header\n");
++			goto out;
++		}
++		snprintf(name, sizeof(name), "adsp2.b%02u", (unsigned)hash_idx);
++		for (uint32_t i = 0; i < hdr.count; i++) {
++			if (strncmp(entries[i].name, name, 32) == 0) {
++				hash_off = (int)i;
++			}
++		}
++		if (hash_off < 0) {
++			printf("SWEET ADSP: %s missing\n", name);
++			goto out;
++		}
++		if (entries[hash_off].size < hash_size) {
++			printf("SWEET ADSP: hash segment too small (%u < %u)\n",
++			    entries[hash_off].size, hash_size);
++			goto out;
++		}
++	}
++	if (ehdr_size + hash_size > 0x2000) {
++		printf("SWEET ADSP: metadata too large (%u)\n", ehdr_size + hash_size);
++		goto out;
++	}
++
++	if (kmem_alloc_contig(kernel_map, &md_va, 0x2000, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET ADSP: no metadata memory\n");
++		goto out;
++	}
++	md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md_va));
++	/* KMA_ZERO dirtied the pages through the cached kernel mapping; drop
++	 * those lines before filling the buffer through a device window, or a
++	 * later eviction would overwrite the metadata TZ just read.
++	 */
++	flush_dcache64((addr64_t)md_va, 0x2000, FALSE);
++	err = sa_copy_phys(md_pa, blob_pa + entries[md_off].off, ehdr_size);
++	if (err) {
++		goto out;
++	}
++	err = sa_copy_phys(md_pa + ehdr_size,
++	    blob_pa + entries[hash_off].off, hash_size);
++	if (err) {
++		goto out;
++	}
++	printf("SWEET ADSP: metadata %#x+%#x at %#llx\n", ehdr_size, hash_size,
++	    (unsigned long long)md_pa);
++
++	/* 5. PAS: init image, mem setup, then load the segments. */
++	ret = sa_scm_retry(0x02, 0x01, 0x82, PAS_ID, md_pa, 0, 0, &r1, &r2);
++	sa_scm_print("pas_init_image", ret, r1, r2);
++	if (ret != 0 || r1 != 0) {
++		goto out;
++	}
++	ret = sa_scm_retry(0x02, 0x02, 0x03, PAS_ID, ADSP_REGION_PA,
++	    max_addr - min_addr, 0, &r1, &r2);
++	sa_scm_print("pas_mem_setup", ret, r1, r2);
++	if (ret != 0 || r1 != 0) {
++		goto out;
++	}
++
++	for (unsigned i = 0; i < ehdr.phnum; i++) {
++		struct elf32_phdr *p = &phdrs[i];
++		const struct fw_entry *fe = NULL;
++		uint64_t dst;
++		uint32_t copied = 0;
++
++		if (p->type != PT_LOAD ||
++		    (p->flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || !p->memsz) {
++			continue;
++		}
++		snprintf(name, sizeof(name), "adsp2.b%02u", i);
++		for (uint32_t j = 0; j < hdr.count; j++) {
++			if (strncmp(entries[j].name, name, 32) == 0) {
++				fe = &entries[j];
++				break;
++			}
++		}
++		dst = ADSP_REGION_PA + (p->paddr - min_addr);
++		if (p->filesz) {
++			if (fe == NULL || fe->size < p->filesz) {
++				printf("SWEET ADSP: %s missing/short (need %#x)\n",
++				    name, p->filesz);
++				err = ENOENT;
++				break;
++			}
++			err = sa_copy_phys(dst, blob_pa + fe->off, p->filesz);
++			if (err) {
++				break;
++			}
++			copied = p->filesz;
++		}
++		if (p->memsz > copied) {
++			err = sa_zero_phys(dst + copied, p->memsz - copied);
++			if (err) {
++				break;
++			}
++		}
++		printf("SWEET ADSP: loaded %s %#x bytes -> %#llx\n",
++		    name, copied, (unsigned long long)dst);
++		sa_wait(50);
++	}
++	if (err) {
++		printf("SWEET ADSP: segment load failed %d\n", err);
++		goto out;
++	}
++
++	/* 6. Hand the image to TZ and release the Q6. */
++	ret = sa_scm_retry(0x02, 0x05, 0x01, PAS_ID, 0, 0, 0, &r1, &r2);
++	sa_scm_print("pas_auth_and_reset", ret, r1, r2);
++	if (ret != 0 || r1 != 0) {
++		goto out;
++	}
++	printf("SWEET ADSP: Q6 released, waiting 3s\n");
++	sa_wait(3000);
++
++	/*
++	 * 7. Optional LPASS probes.  Both fault (panic) if the block is still
++	 * XPU-protected, so they are opt-in: the PAS load itself is complete by
++	 * here and a normal boot must not die on a diagnostic read.
++	 */
++	{
++		int probe = 0;
++
++		(void)PE_parse_boot_argn("sweetlpass", &probe, sizeof(probe));
++		if (probe) {
++			vm_offset_t win = sa_win_alloc(0x4000);
++
++			if (win != 0) {
++				vm_offset_t rx = sa_win_map(win, LPASS_RX_PA, 16);
++
++				printf("SWEET ADSP: lpass_rx_macro %08x %08x %08x %08x\n",
++				    *(volatile uint32_t *)(rx + 0x0),
++				    *(volatile uint32_t *)(rx + 0x4),
++				    *(volatile uint32_t *)(rx + 0x8),
++				    *(volatile uint32_t *)(rx + 0xc));
++				sa_win_free(win, 0x4000);
++			}
++		}
++
++		probe = 0;
++		(void)PE_parse_boot_argn("sweetnoc", &probe, sizeof(probe));
++		if (probe) {
++			vm_offset_t win = sa_win_alloc(0x4000);
++
++			if (win != 0) {
++				vm_offset_t noc = sa_win_map(win, ADSP_NOC_PA, 16);
++
++				printf("SWEET ADSP: lpass_ag_noc %08x %08x %08x %08x\n",
++				    *(volatile uint32_t *)(noc + 0x0),
++				    *(volatile uint32_t *)(noc + 0x4),
++				    *(volatile uint32_t *)(noc + 0x8),
++				    *(volatile uint32_t *)(noc + 0xc));
++				sa_win_free(win, 0x4000);
++			}
++		}
++	}
++
++out:
++	printf("SWEET ADSP: ===== done =====\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_adsp_init(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(sweet_adsp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET ADSP: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
++/* SCM calls follow the Linux qcom_scm a6 resume protocol. */

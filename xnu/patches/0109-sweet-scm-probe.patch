@@ -1,0 +1,129 @@
+--- a/bsd/dev/sweet_audio.c
++++ b/bsd/dev/sweet_audio.c
+@@ -64,10 +64,6 @@
+ #define CMDDB_HEADER    144u
+ #define CMDDB_ENTRY     24u
+ 
+-/* ADSP PAS register block (remoteproc-adsp@03000000).  Read-only. */
+-#define ADSP_PAS_PA     0x03000000u
+-#define ADSP_PAS_SIZE   0x00010000u
+-
+ static int sweet_audio_chan;
+ 
+ static void
+@@ -187,20 +183,64 @@
+ 	printf("SWEET CMDDB: %u entries dumped\n", total);
+ }
+ 
+-static void
+-au_pas_dump(void)
++static uint32_t
++au_smc(uint32_t svc, uint32_t cmd, uint64_t arg0, uint64_t *r1, uint64_t *r2)
+ {
+-	vm_offset_t pas = au_map(ADSP_PAS_PA, ADSP_PAS_SIZE);
++	register uint64_t x0 __asm__("x0") =
++	    0xC2000000ull | ((uint64_t)(svc & 0xff) << 8) | (cmd & 0xff);
++	register uint64_t x1 __asm__("x1") = 1;   /* one VAL argument */
++	register uint64_t x2 __asm__("x2") = arg0;
++	register uint64_t x3 __asm__("x3") = 0;
++	register uint64_t x4 __asm__("x4") = 0;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
+ 
+-	if (pas == 0) {
+-		return;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++	    :
++	    : "memory");
++	if (r1 != NULL) {
++		*r1 = x1;
+ 	}
+-	for (unsigned off = 0; off < 0x80; off += 0x10) {
+-		printf("SWEET PAS: %#04x: %08x %08x %08x %08x\n", off,
+-		    au_rd(pas, off), au_rd(pas, off + 4),
+-		    au_rd(pas, off + 8), au_rd(pas, off + 12));
+-		au_wait(100);
++	if (r2 != NULL) {
++		*r2 = x2;
++	}
++	return (uint32_t)x0;
++}
++
++/*
++ * Ask TZ which SCM calls exist (QCOM_SCM_SVC_INFO / IS_CALL_AVAIL).  This is
++ * the same convention probe the Linux qcom_scm driver runs: x0 is the SIP
++ * function id, x1 the arginfo word, x2 the target function id.  No buffers,
++ * no shared memory, no side effects.
++ */
++static void
++au_scm_probe(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t svc;
++		uint32_t cmd;
++	} calls[] = {
++		{ "info.is_call_avail(info)", 0x06, 0x01 },
++		{ "pil.pas_is_supported",     0x02, 0x07 },
++		{ "pil.pas_auth_and_reset",   0x02, 0x05 },
++		{ "pil.pas_shutdown",         0x02, 0x06 },
++	};
++
++	printf("SWEET SCM: probe via smc #0 (fnid base 0xC2000000)\n");
++	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
++		uint64_t r1 = 0, r2 = 0;
++		uint32_t target = 0x02000000u |
++		    ((calls[i].svc & 0xffu) << 8) | (calls[i].cmd & 0xffu);
++		uint32_t ret = au_smc(0x06, 0x01, target, &r1, &r2);
++
++		printf("SWEET SCM: is_call_avail(%s) ret=0x%x r1=0x%llx r2=0x%llx\n",
++		    calls[i].name, ret, (unsigned long long)r1,
++		    (unsigned long long)r2);
++		au_wait(300);
+ 	}
++	printf("SWEET SCM: probe done\n");
+ }
+ 
+ static void
+@@ -208,31 +248,31 @@
+ {
+ 	int stage = 0;
+ 	int cmddb = 0;
+-	int pas = 0;
++	int scm = 0;
+ 	vm_offset_t tlmm, noc, cc, va;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("sweetaudio", &stage, sizeof(stage));
+ 	(void)PE_parse_boot_argn("sweetcmddb", &cmddb, sizeof(cmddb));
+-	(void)PE_parse_boot_argn("sweetpas", &pas, sizeof(pas));
+-	if (stage <= 0 && !cmddb && !pas) {
+-		printf("SWEET AUDIO: disabled (sweetaudio=1 sweetcmddb=1 sweetpas=1)\n");
++	(void)PE_parse_boot_argn("sweetscm", &scm, sizeof(scm));
++	if (stage <= 0 && !cmddb && !scm) {
++		printf("SWEET AUDIO: disabled (sweetaudio=1 sweetcmddb=1 sweetscm=1)\n");
+ 		goto out;
+ 	}
+ 
+ 	/* Let the gadget, the console thread and userland settle first. */
+-	printf("SWEET AUDIO: ===== probe stage <= %d cmddb=%d pas=%d, start in %ds =====\n",
+-	    stage, cmddb, pas, stage > 0 ? 60 : 20);
++	printf("SWEET AUDIO: ===== probe stage <= %d cmddb=%d scm=%d, start in %ds =====\n",
++	    stage, cmddb, scm, stage > 0 ? 60 : 20);
+ 	au_wait(stage > 0 ? 60000 : 20000);
+ 
+ 	if (cmddb) {
+ 		printf("SWEET CMDDB: --- dump AOP command DB ---\n");
+ 		au_cmddb_dump();
+ 	}
+-	if (pas) {
+-		printf("SWEET PAS: --- dump ADSP PAS registers ---\n");
+-		au_pas_dump();
++	if (scm) {
++		printf("SWEET SCM: --- probe TZ SCM calls ---\n");
++		au_scm_probe();
+ 	}
+ 	if (stage > 0) {
+ 

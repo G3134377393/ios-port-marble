@@ -1,0 +1,29 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -522,7 +522,7 @@
+ 			    iter, mt_rd(gpio, GPIO_IO(21)) & 1u, tda);
+ 		}
+ 		if (mt_rd(gpio, GPIO_IO(21)) & 1u) {
+-			mt_wait(10);
++			mt_wait(2);
+ 			continue;
+ 		}
+ 		uint8_t ev[8 + 10 * 8 + 2];
+@@ -536,7 +536,7 @@
+ 		}
+ 		printf("\n");
+ 		if (status == 0) {
+-			mt_wait(10);
++			mt_wait(2);
+ 			continue;
+ 		}
+ 		uint32_t hsum = 0;
+@@ -612,7 +612,7 @@
+ 		}
+ 		uint8_t z[4] = {0};
+ 		bb_write(gpio, clk, mosi, miso, tda, z, sizeof(z));
+-		mt_wait(10);
++		mt_wait(2);
+ 	}
+ 	/* The event loop is the driver: it must live for the whole boot,
+ 	 * not stop after a fixed self-test window (24000 x 10 ms = 4 min,

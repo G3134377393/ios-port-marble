@@ -1,0 +1,151 @@
+--- a/bsd/dev/sweet_audio.c
++++ b/bsd/dev/sweet_audio.c
+@@ -58,6 +58,16 @@
+ #define VA_MACRO_PA     0x033f0000u
+ #define LPASS_BLK_SIZE  0x00004000u
+ 
++/* AOP command DB (reserved-memory aop_cmd_db_region@80860000).  Read-only. */
++#define CMDDB_PA        0x80860000u
++#define CMDDB_SIZE      0x00020000u
++#define CMDDB_HEADER    144u
++#define CMDDB_ENTRY     24u
++
++/* ADSP PAS register block (remoteproc-adsp@03000000).  Read-only. */
++#define ADSP_PAS_PA     0x03000000u
++#define ADSP_PAS_SIZE   0x00010000u
++
+ static int sweet_audio_chan;
+ 
+ static void
+@@ -115,24 +125,117 @@
+ 	}
+ }
+ 
++static uint16_t
++au_rd16(vm_offset_t base, uint32_t off)
++{
++	uint16_t v = *(volatile uint16_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
+ static void
++au_name(char *dst, const uint32_t *key)
++{
++	unsigned i;
++
++	for (i = 0; i < 8; i++) {
++		char c = (char)((key[i / 4] >> (8u * (i % 4))) & 0xffu);
++		dst[i] = (c >= 0x20 && c < 0x7f) ? c : '.';
++	}
++}
++
++static void
++au_cmddb_dump(void)
++{
++	vm_offset_t db = au_map(CMDDB_PA, CMDDB_SIZE);
++	unsigned total = 0;
++
++	if (db == 0) {
++		return;
++	}
++	printf("SWEET CMDDB: header %08x %08x %08x %08x\n",
++	    au_rd(db, 0), au_rd(db, 4), au_rd(db, 8), au_rd(db, 12));
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = au_rd16(db, h);
++		unsigned count = au_rd16(db, h + 6);
++		unsigned eoff = au_rd16(db, h + 2);
++		unsigned aoff = au_rd16(db, h + 4);
++
++		if (slave == 0xffffu) {
++			continue;
++		}
++		printf("SWEET CMDDB: slave %u entries=%u off=0x%x aux=0x%x count=%u\n",
++		    slave, eoff, eoff, aoff, count);
++		if (count > 256) {
++			printf("SWEET CMDDB: slave %u count %u rejected\n", slave, count);
++			continue;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = CMDDB_HEADER + eoff + CMDDB_ENTRY * j;
++			uint32_t key[2] = { au_rd(db, e), au_rd(db, e + 4) };
++			char name[9] = { 0 };
++
++			au_name(name, key);
++			printf("SWEET CMDDB: %u:%-14s addr=0x%08x prio=%u:%u aux=%u@%u\n",
++			    slave, name, au_rd(db, e + 16), au_rd(db, e + 8),
++			    au_rd(db, e + 12), au_rd16(db, e + 20), au_rd16(db, e + 22));
++			total++;
++			au_wait(20);
++		}
++	}
++	printf("SWEET CMDDB: %u entries dumped\n", total);
++}
++
++static void
++au_pas_dump(void)
++{
++	vm_offset_t pas = au_map(ADSP_PAS_PA, ADSP_PAS_SIZE);
++
++	if (pas == 0) {
++		return;
++	}
++	for (unsigned off = 0; off < 0x80; off += 0x10) {
++		printf("SWEET PAS: %#04x: %08x %08x %08x %08x\n", off,
++		    au_rd(pas, off), au_rd(pas, off + 4),
++		    au_rd(pas, off + 8), au_rd(pas, off + 12));
++		au_wait(100);
++	}
++}
++
++static void
+ sweet_audio_thread(void *arg, wait_result_t result)
+ {
+ 	int stage = 0;
++	int cmddb = 0;
++	int pas = 0;
+ 	vm_offset_t tlmm, noc, cc, va;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("sweetaudio", &stage, sizeof(stage));
+-	if (stage <= 0) {
+-		printf("SWEET AUDIO: disabled (sweetaudio=1)\n");
++	(void)PE_parse_boot_argn("sweetcmddb", &cmddb, sizeof(cmddb));
++	(void)PE_parse_boot_argn("sweetpas", &pas, sizeof(pas));
++	if (stage <= 0 && !cmddb && !pas) {
++		printf("SWEET AUDIO: disabled (sweetaudio=1 sweetcmddb=1 sweetpas=1)\n");
+ 		goto out;
+ 	}
+ 
+ 	/* Let the gadget, the console thread and userland settle first. */
+-	printf("SWEET AUDIO: ===== probe stage <= %d, start in 60s =====\n", stage);
+-	au_wait(60000);
++	printf("SWEET AUDIO: ===== probe stage <= %d cmddb=%d pas=%d, start in %ds =====\n",
++	    stage, cmddb, pas, stage > 0 ? 60 : 20);
++	au_wait(stage > 0 ? 60000 : 20000);
+ 
++	if (cmddb) {
++		printf("SWEET CMDDB: --- dump AOP command DB ---\n");
++		au_cmddb_dump();
++	}
++	if (pas) {
++		printf("SWEET PAS: --- dump ADSP PAS registers ---\n");
++		au_pas_dump();
++	}
++	if (stage > 0) {
++
+ 	printf("SWEET AUDIO: --- stage 1: TLMM gpio43 + LPASS AG NoC ---\n");
+ 	tlmm = au_map(GPIO43_MAP, GPIO43_MAP_SIZE);
+ 	if (tlmm != 0) {
+@@ -175,7 +278,8 @@
+ 		printf("SWEET AUDIO: --- stage 3 done ---\n");
+ 	}
+ 
+-	printf("SWEET AUDIO: ===== probe done =====\n");
++		printf("SWEET AUDIO: ===== probe done =====\n");
++	}
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);

@@ -743,7 +743,7 @@
 +/* SCM calls follow the Linux qcom_scm a6 resume protocol. */
 --- /dev/null
 +++ b/bsd/dev/sweet_glink.c
-@@ -0,0 +1,1012 @@
+@@ -0,0 +1,1033 @@
 +/*
 + * SWEET: minimal GLINK-over-SMEM client for the ADSP GPR router.
 + *
@@ -1174,8 +1174,10 @@
 +	case CMD_OPEN: {
 +		uint32_t n = p2;
 +
-+		if (n > 32) {
-+			n = 32;
++		if (n > 56) {
++			printf("SWEET GLINK: bad OPEN name len %u\n", n);
++			g_rx_advance(8);
++			break;
 +		}
 +		if (avail < 8 + n) {
 +			return -1;
@@ -1183,9 +1185,15 @@
 +		g_fifo_read(g_rx_off, g_rx_len, tail + 8, tmp, n);
 +		tmp[n] = 0;
 +		printf("SWEET GLINK: remote OPEN rcid=%u name=%s\n", p1, tmp);
-+		g_rcid = p1;
-+		g_remote_open = 1;
-+		g_rx_advance((8 + n + 7u) & ~7u);
++		if (n == G_LINK_NAME_LEN &&
++		    tmp[0] == 'a' && tmp[1] == 'd' && tmp[2] == 's' &&
++		    tmp[3] == 'p' && tmp[4] == '_' && tmp[5] == 'a' &&
++		    tmp[6] == 'p' && tmp[7] == 'p' && tmp[8] == 's') {
++			/* The rcid of *our* channel, not of the last OPEN. */
++			g_rcid = p1;
++			g_remote_open = 1;
++		}
++		g_rx_advance((8 + p2 + 7u) & ~7u);
 +		break;
 +	}
 +
@@ -1262,6 +1270,13 @@
 +		left = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) |
 +		    ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
 +		liid = p2;
++		/* A bogus or desynced header must not spin the kernel thread. */
++		if (chunk > g_rx_len || left > g_rx_len) {
++			printf("SWEET GLINK: bad TX_DATA chunk %u left %u\n",
++			    chunk, left);
++			g_rx_advance(8);
++			break;
++		}
 +		if (avail < 16 + chunk) {
 +			return -1;
 +		}
@@ -1323,11 +1338,11 @@
 +	for (;;) {
 +		int got = 0;
 +
-+		while (g_rx_one() == 0) {
++		while (got < 256 && g_rx_one() == 0) {
 +			seen++;
 +			got++;
 +		}
-+		if (waited >= budget_ms) {
++		if (waited >= budget_ms || got >= 256) {
 +			break;
 +		}
 +		if (!got) {
@@ -1384,8 +1399,8 @@
 +		printf("SWEET GLINK: requesting %u-byte intent\n", len);
 +		g_send(CMD_RX_INTENT_REQ, (uint16_t)g_lcid, len, NULL, 0);
 +		if (!g_wait_riid(len, 2000)) {
-+			printf("SWEET GLINK: no remote intent for %u bytes\n",
-+			    len);
++			printf("SWEET GLINK: no remote intent for %u bytes "
++			    "(rx_avail=%u)\n", len, g_rx_avail());
 +			return;
 +		}
 +	}
@@ -1394,6 +1409,7 @@
 +		return;
 +	}
 +	r->in_use = 1;
++	printf("SWEET GLINK: TX_DATA iid=%u len=%u\n", r->id, len);
 +	g_send_tx_data(r->id, pkt, len);
 +}
 +
@@ -1724,10 +1740,15 @@
 +	    g_open_acked, g_remote_open, g_rcid);
 +	if (g_open_acked && g_remote_open) {
 +		g_send_open_ack(g_rcid);
++		printf("SWEET GLINK: OPEN_ACK sent for rcid=%u\n", g_rcid);
 +		for (int i = 0; i < g_nliids; i++) {
 +			g_advertise_intent(g_liids[i].id, g_liids[i].size);
 +		}
-+		g_drain(50);
++		printf("SWEET GLINK: %d intents advertised\n", g_nliids);
++		g_drain(100);
++	} else {
++		printf("SWEET GLINK: channel did not open, skipping PRM\n");
++		goto out;
 +	}
 +
 +	/* Cast the PRM vote and look at the reply. */

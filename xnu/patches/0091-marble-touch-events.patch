@@ -1,6 +1,14 @@
 --- a/bsd/dev/marble_touch.c
 +++ b/bsd/dev/marble_touch.c
-@@ -393,7 +393,7 @@
+@@ -25,6 +25,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void marble_touch_init(void);
+ 
+ #define MARBLE_SE_PA       0x00990000u   /* QUP wrapper 0 SE4, spi@990000 */
+@@ -393,7 +394,7 @@
  		printf("SWEET MARBLE TOUCH: disabled (marble_touch=0)\n");
  		goto out;
  	}
@@ -9,7 +17,7 @@
  	mt_wait(15000);
  
  	gcc = ml_io_map(MARBLE_GCC_PA, MARBLE_GCC_SIZE);
-@@ -482,37 +482,143 @@
+@@ -482,37 +483,143 @@
  	static uint8_t info[1024];
  	memset(info, 0, sizeof(info));
  	bb_read(gpio, clk, mosi, miso, 0x00010070u, info, ilen);
@@ -55,7 +63,7 @@
 +		goto out;
  	}
 -	printf("SWEET MARBLE TOUCH: stage-7 done\n");
-+
+ 
 +	/* GT9916R report: 8-byte head + 2 points, checksum after points. */
 +	int lastx[10], lasty[10];
 +	uint32_t active = 0;
@@ -166,7 +174,7 @@
 +	printf("SWEET MARBLE TOUCH: stage-8 done\n");
  
  
- 
++
 +
  out:
  	(void)thread_terminate(current_thread());

@@ -1,0 +1,138 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -0,0 +1,107 @@
++/*
++ * Marble (SM7475) Goodix GT9916R SPI touch: stage-1 diagnostic.
++ *
++ * The actual touch controller is a Goodix "Berlin" GT9916R on GENI SPI
++ * (spi@990000), not the sweet I2C GT9896.  This first stage intentionally
++ * only *reads* the QUP SE and TLMM registers: when XNU is booted from TWRP
++ * the Android touch driver has just powered the rails and configured the SE,
++ * so a read-only probe tells us whether that warm state survives the jump.
++ * No PMIC, clock or TLMM writes are issued yet.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void marble_touch_init(void);
++
++#define MARBLE_SE_PA     0x00990000u   /* QUP SE used by spi@990000 */
++#define MARBLE_SE_SIZE   0x4000u
++#define MARBLE_TLMM_PA   0x0f000000u   /* marble north TLMM */
++#define MARBLE_TLMM_SIZE 0x20000u
++
++#define SE_STATUS   0x040u
++#define SE_FW       0x068u
++#define SE_IRQ      0x610u
++#define SE_TX_COUNT 0x800u
++#define SE_RX_COUNT 0x804u
++#define SE_HW_TX    0xe24u
++#define SE_HW_RX    0xe28u
++
++#define GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define GPIO_IO(n)  (GPIO_CFG(n) + 4u)
++
++static int marble_touch_chan;
++
++static uint32_t
++mt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++mt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&marble_touch_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++marble_touch_thread(void *arg, wait_result_t result)
++{
++	int enabled = 0;
++	vm_offset_t se, gpio;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("marble_touch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET MARBLE TOUCH: disabled (marble_touch=0)\n");
++		goto out;
++	}
++	printf("SWEET MARBLE TOUCH: diagnostic start; waiting 30s\n");
++	mt_wait(30000);
++
++	se = ml_io_map(MARBLE_SE_PA, MARBLE_SE_SIZE);
++	gpio = ml_io_map(MARBLE_TLMM_PA, MARBLE_TLMM_SIZE);
++	printf("SWEET MARBLE TOUCH: se=%#lx gpio=%#lx\n",
++	    (unsigned long)se, (unsigned long)gpio);
++	if (se) {
++		printf("SWEET MARBLE TOUCH: se fw=%#x status=%#x irq=%#x hwtx=%#x hwrx=%#x txc=%#x rxc=%#x\n",
++		    mt_rd(se, SE_FW), mt_rd(se, SE_STATUS), mt_rd(se, SE_IRQ),
++		    mt_rd(se, SE_HW_TX), mt_rd(se, SE_HW_RX),
++		    mt_rd(se, SE_TX_COUNT), mt_rd(se, SE_RX_COUNT));
++	}
++	if (gpio) {
++		printf("SWEET MARBLE TOUCH: gpio20 cfg=%#x io=%#x | gpio21 cfg=%#x io=%#x\n",
++		    mt_rd(gpio, GPIO_CFG(20)), mt_rd(gpio, GPIO_IO(20)),
++		    mt_rd(gpio, GPIO_CFG(21)), mt_rd(gpio, GPIO_IO(21)));
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++marble_touch_init(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(marble_touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET MARBLE TOUCH: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/marble_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void marble_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -702,6 +703,7 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	marble_touch_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }

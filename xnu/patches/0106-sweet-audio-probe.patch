@@ -1,0 +1,223 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/marble_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_audio.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void marble_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_audio_probe(void);
+ 
+ #define REG_CAP         0x00
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -704,5 +704,6 @@
+ 	sweet_touch_init();
+ 	marble_touch_init();
+ 	sweet_usb_probe();
++	sweet_audio_probe();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_audio.c
+@@ -0,0 +1,191 @@
++/*
++ * SWEET: LPASS / WCD938x audio bring-up, step 1 - read-only state probe.
++ *
++ * The phone's audio hardware is Qualcomm LPASS: the RX/TX/VA CDC macros and
++ * their SoundWire masters are register blocks in the LPASS address space, and
++ * the WCD938x codec sits on the RX/TX SoundWire buses, held in reset by TLMM
++ * GPIO 43.  The AP reaches all of it through the LPASS AG NoC.
++ *
++ * Nothing here writes a register.  The boot argument sweetaudio picks how far
++ * the probe goes, so a fault in an unpowered LPASS block still leaves the
++ * earlier output on the UDP console:
++ *   1  TLMM GPIO43 state and the LPASS AG NoC (always-on domains)
++ *   2  LPASS audio CC clock mux registers (the mclk selectors the CDC driver
++ *      programs, from qcom,rx_mclk_mode_muxsel and friends in the live DTS)
++ *   3  LPASS CDC macro and SoundWire master identity registers
++ *
++ * A synchronous external abort here is a result, not a failure: the panic
++ * names the address that LPASS refused while the audio subsystem is down,
++ * which tells us which power/clock vote the next step has to add.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_audio_probe(void);
++
++#define TLMM_PA         0x0f100000u   /* mainline sm8450.dtsi, not 0x0f000000 */
++#define TLMM_SIZE       0x00300000u
++#define GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
++#define GPIO_IO(n)      (GPIO_CFG(n) + 4u)
++#define WCD_RST_GPIO    43
++
++#define NOC_PA          0x03c40000u   /* qcom,waipio-lpass_ag_noc */
++#define NOC_SIZE        0x00017200u
++
++#define LPASS_CC_PA     0x033a0000u   /* mclk mode mux registers */
++#define LPASS_CC_SIZE   0x00010000u
++#define RX_MCLK_MUX     0x00040d8u
++#define WSA_MCLK_MUX    0x00020e0u
++#define VA_MACRO_MUX_PA 0x03420000u   /* qcom,va_mclk_mode_muxsel */
++#define MUX_PA_SIZE     0x00004000u
++
++#define RX_MACRO_PA     0x03200000u
++#define RX_SWR_PA       0x03210000u
++#define TX_MACRO_PA     0x03220000u
++#define VA_SWR_PA       0x033b0000u
++#define VA_MACRO_PA     0x033f0000u
++#define LPASS_BLK_SIZE  0x00004000u
++
++static int sweet_audio_chan;
++
++static void
++au_wait(unsigned ms)
++{
++	uint64_t deadline;
++
++	if (ms == 0) {
++		return;
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sweet_audio_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++au_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static vm_offset_t
++au_map(uint32_t pa, uint32_t size)
++{
++	vm_offset_t v = ml_io_map(pa, size);
++
++	if (v == 0) {
++		printf("SWEET AUDIO: map %#x failed\n", pa);
++	}
++	return v;
++}
++
++/* Print one register and give the console thread time to ship it on UDP. */
++static void
++au_val(const char *name, uint32_t off, uint32_t v)
++{
++	printf("SWEET AUDIO: %-18s +%#06x = %#010x\n", name, off, v);
++	au_wait(150);
++}
++
++static const uint32_t au_id_offs[] = { 0x0, 0x4, 0x8, 0xc, 0x10, 0x14 };
++
++static void
++au_block(const char *name, uint32_t pa)
++{
++	vm_offset_t base = au_map(pa, LPASS_BLK_SIZE);
++
++	if (base == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(au_id_offs) / sizeof(au_id_offs[0]); i++) {
++		au_val(name, au_id_offs[i], au_rd(base, au_id_offs[i]));
++	}
++}
++
++static void
++sweet_audio_thread(void *arg, wait_result_t result)
++{
++	int stage = 0;
++	vm_offset_t tlmm, noc, cc, va;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweetaudio", &stage, sizeof(stage));
++	if (stage <= 0) {
++		printf("SWEET AUDIO: disabled (sweetaudio=1)\n");
++		goto out;
++	}
++
++	/* Let the gadget, the console thread and userland settle first. */
++	printf("SWEET AUDIO: ===== probe stage <= %d, start in 20s =====\n", stage);
++	au_wait(20000);
++
++	printf("SWEET AUDIO: --- stage 1: TLMM gpio43 + LPASS AG NoC ---\n");
++	tlmm = au_map(TLMM_PA, TLMM_SIZE);
++	if (tlmm != 0) {
++		au_val("tlmm gpio43 cfg", GPIO_CFG(WCD_RST_GPIO),
++		    au_rd(tlmm, GPIO_CFG(WCD_RST_GPIO)));
++		au_val("tlmm gpio43 io", GPIO_IO(WCD_RST_GPIO) - GPIO_CFG(WCD_RST_GPIO),
++		    au_rd(tlmm, GPIO_IO(WCD_RST_GPIO)));
++	}
++	noc = au_map(NOC_PA, NOC_SIZE);
++	if (noc != 0) {
++		for (unsigned i = 0; i < sizeof(au_id_offs) / sizeof(au_id_offs[0]); i++) {
++			au_val("lpass_ag_noc", au_id_offs[i], au_rd(noc, au_id_offs[i]));
++		}
++	}
++	printf("SWEET AUDIO: --- stage 1 done ---\n");
++	au_wait(1000);
++
++	if (stage >= 2) {
++		printf("SWEET AUDIO: --- stage 2: LPASS audio CC muxes ---\n");
++		cc = au_map(LPASS_CC_PA, LPASS_CC_SIZE);
++		if (cc != 0) {
++			au_val("rx_mclk_mux", RX_MCLK_MUX, au_rd(cc, RX_MCLK_MUX));
++			au_val("wsa_mclk_mux", WSA_MCLK_MUX, au_rd(cc, WSA_MCLK_MUX));
++		}
++		va = au_map(VA_MACRO_MUX_PA, MUX_PA_SIZE);
++		if (va != 0) {
++			au_val("va_mclk_mux", 0x0, au_rd(va, 0x0));
++		}
++		printf("SWEET AUDIO: --- stage 2 done ---\n");
++		au_wait(1000);
++	}
++
++	if (stage >= 3) {
++		printf("SWEET AUDIO: --- stage 3: LPASS CDC macros + SoundWire ---\n");
++		au_block("rx_macro", RX_MACRO_PA);
++		au_block("rx_swr", RX_SWR_PA);
++		au_block("tx_macro", TX_MACRO_PA);
++		au_block("va_swr", VA_SWR_PA);
++		au_block("va_macro", VA_MACRO_PA);
++		printf("SWEET AUDIO: --- stage 3 done ---\n");
++	}
++
++	printf("SWEET AUDIO: ===== probe done =====\n");
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_audio_probe(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(sweet_audio_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET AUDIO: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

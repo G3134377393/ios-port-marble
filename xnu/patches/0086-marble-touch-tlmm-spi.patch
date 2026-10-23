@@ -1,0 +1,395 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -1,21 +1,21 @@
+ /*
+- * Marble (SM7475) Goodix GT9916R SPI touch: stage-2 clock/pin/SE probe.
++ * Marble (SM7475) Goodix GT9916R SPI touch: stage-3 hardware bring-up probe.
+  *
+- * The touch controller is a Goodix "Berlin" GT9916R on GENI SPI at
+- * spi@990000 (QUP wrapper 0, SE4), not the sweet I2C GT9896.  The stage-1
+- * probe read the SE before powering its clocks and the SoC took a
+- * synchronous abort, so this stage brings up the GCC QUP wrapper/SE
+- * branches and the SE RCG first, then reads the SE.  It still does not
+- * touch the PMIC rails or the touch IC: those follow only after the SE
+- * reports which protocol firmware the bootloader left in it.
++ * Stage 2 proved that QUP wrapper 0 SE4 (spi@990000) is reachable once its
++ * GCC clocks are voted, and that the bootloader left SPI firmware in the SE
++ * (FW_REVISION protocol 1).  It also showed that the TLMM base was wrong:
++ * the cape DTS node starts at 0xf000000 but the real TLMM register block is
++ * at 0x0f100000 (mainline sm8450.dtsi), so the 0x0f010000 access aborted.
+  *
+- * Registers are from mainline gcc-sm8450.c (SM8475/cape variant matches
+- * this board's "qcom,cape-gcc"): QUP wrapper 0 local SE4 RCG 0x274e4,
+- * branch halt 0x274dc, and the GCC QUP CBCR vote register 0x62008.
++ * This stage uses the correct TLMM base, reads the bootloader's GPIO state,
++ * programs SE4's SPI pins/reset/IRQ, dumps the RPMh RSC/TCS geometry read-only
++ * for the next rail vote, and runs one SPI FIFO transfer.  It still does not
++ * write the PMIC rails and does not depend on the touch IC answering.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -30,8 +30,10 @@
+ #define MARBLE_SE_SIZE     0x4000u
+ #define MARBLE_GCC_PA      0x00100000u
+ #define MARBLE_GCC_SIZE    0x1f4200u
+-#define MARBLE_TLMM_PA     0x0f000000u   /* north TLMM */
+-#define MARBLE_TLMM_SIZE   0x20000u
++#define MARBLE_TLMM_PA     0x0f100000u   /* mainline sm8450.dtsi, not f000000 */
++#define MARBLE_TLMM_SIZE   0x300000u
++#define MARBLE_RSC_PA      0x17a20000u   /* apps_rsc drv-2 (DT drv-id 2) */
++#define MARBLE_TCS_PA      0x17a20d00u   /* drv-2 base + qcom,tcs-offset */
+ 
+ /* GCC: mainline gcc-sm8450.c branch vote/halt registers. */
+ #define GCC_QUPV3_VOTE     0x62008u
+@@ -54,21 +56,61 @@
+ #define RCG_N                  0xcu
+ #define RCG_D                  0x10u
+ #define RCG_DFS_EN             0x14u
+-#define RCG_CFG_MASK           0x371fu    /* source, divider and mode bits */
++#define RCG_CFG_MASK           0x371fu
+ 
+-/* GENI SE registers (mainline geni-se.h). */
++/* GENI SE registers (mainline geni-se.h / spi-geni-qcom.c). */
+ #define SE_STATUS          0x040u
+ #define SE_M_CLK_CFG       0x048u
+ #define SE_IF_DISABLE      0x064u
+ #define SE_FW              0x068u
+ #define SE_CLK_SEL         0x07cu
+ #define SE_M_IRQ_STATUS    0x610u
++#define SE_M_IRQ_EN        0x614u
++#define SE_M_IRQ_CLEAR     0x618u
++#define SE_S_IRQ_CLEAR     0x648u
+ #define SE_TX_COUNT        0x800u
+ #define SE_RX_COUNT        0x804u
+ #define SE_IOS             0x908u
+ #define SE_HW_TX           0xe24u
+ #define SE_HW_RX           0xe28u
++#define SE_M_CMD0          0x600u
++#define SE_M_CMD_CTRL      0x604u
++#define SE_TX_FIFO         0x700u
++#define SE_RX_FIFO         0x780u
+ 
++#define GENI_FORCE_DEFAULT 0x020u
++#define GENI_OUTPUT_CTRL   0x024u
++#define GENI_CGC_CTRL      0x028u
++#define GENI_BYTE_GRAN     0x254u
++#define GENI_TX_PACK_CFG0  0x260u
++#define GENI_TX_PACK_CFG1  0x264u
++#define GENI_RX_PACK_CFG0  0x284u
++#define GENI_RX_PACK_CFG1  0x288u
++#define GENI_DMA_MODE_EN   0x258u
++#define GENI_GSI_EVENT_EN  0xe18u
++#define GENI_IRQ_EN_TOPBIT 0xe1cu
++#define GENI_DMA_GEN_CFG   0xe30u
++#define GENI_TX_WM         0x80cu
++#define GENI_RX_WM         0x810u
++#define GENI_RX_RFR_WM     0x814u
++
++#define SE_SPI_CPHA        0x224u
++#define SE_SPI_LOOPBACK    0x22cu
++#define SE_SPI_CPOL        0x230u
++#define SE_SPI_DEMUX_INV   0x24cu
++#define SE_SPI_DEMUX_SEL   0x250u
++#define SE_SPI_TRANS_CFG   0x25cu
++#define SE_SPI_WORD_LEN    0x268u
++#define SE_SPI_TX_LEN      0x26cu
++#define SE_SPI_RX_LEN      0x270u
++#define SE_SPI_CS_TOGGLE   (1u << 1)
++
++#define M_CMD_DONE         (1u << 0)
++#define M_CMD_ERRORS       ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | \
++                            (1u << 5) | (1u << 24) | (1u << 25) | \
++                            (1u << 28) | (1u << 29))
++#define M_COMMON_IRQ_EN    (0x7eu | (0xfu << 22) | (0x3u << 28))
++
+ #define GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define GPIO_IO(n)  (GPIO_CFG(n) + 4u)
+ 
+@@ -111,7 +153,7 @@
+ 	return false;
+ }
+ 
+-static bool
++static void
+ mt_clocks(vm_offset_t gcc)
+ {
+ 	uint32_t cmd, cfg, m, n, d, dfs, vote;
+@@ -132,7 +174,6 @@
+ 	    cmd, cfg, m, n, d, dfs);
+ 
+ 	if (dfs & 1u) {
+-		/* Leave the DFS table alone; it already owns the RCG. */
+ 		printf("SWEET MARBLE TOUCH: se4 RCG is DFS-owned; not rewriting\n");
+ 	} else if ((cfg & RCG_CFG_MASK) == 1u && m == 0 && n == 0 && d == 0) {
+ 		printf("SWEET MARBLE TOUCH: se4 RCG already XO/1\n");
+@@ -146,17 +187,14 @@
+ 		if (!mt_wait_clear(gcc, GCC_SE4_RCG + RCG_CMD, 1u, 1000)) {
+ 			printf("SWEET MARBLE TOUCH: se4 RCG update timeout cmd=%#x\n",
+ 			    mt_rd(gcc, GCC_SE4_RCG + RCG_CMD));
+-			return false;
++		} else {
++			printf("SWEET MARBLE TOUCH: se4 RCG now cmd=%#x cfg=%#x\n",
++			    mt_rd(gcc, GCC_SE4_RCG + RCG_CMD),
++			    mt_rd(gcc, GCC_SE4_RCG + RCG_CFG));
+ 		}
+-		printf("SWEET MARBLE TOUCH: se4 RCG now cmd=%#x cfg=%#x m=%#x n=%#x d=%#x\n",
+-		    mt_rd(gcc, GCC_SE4_RCG + RCG_CMD),
+-		    mt_rd(gcc, GCC_SE4_RCG + RCG_CFG),
+-		    mt_rd(gcc, GCC_SE4_RCG + RCG_M),
+-		    mt_rd(gcc, GCC_SE4_RCG + RCG_N),
+-		    mt_rd(gcc, GCC_SE4_RCG + RCG_D));
+ 	}
+ 
+-	printf("SWEET MARBLE TOUCH: voting QUP0 core/m-ahb/s-ahb/se4\n");
++	printf("SWEET MARBLE TOUCH: voting QUP0 clocks\n");
+ 	mt_wr(gcc, GCC_QUPV3_VOTE, vote | GCC_VOTE_MASK);
+ 	mt_wait(2000);
+ 	printf("SWEET MARBLE TOUCH: gcc vote=%#x (mask %#x)\n",
+@@ -166,14 +204,11 @@
+ 		GCC_WRAP0_CORE_HALT, GCC_WRAP0_CORE_2X_HALT,
+ 		GCC_WRAP0_M_AHB_HALT, GCC_WRAP0_S_AHB_HALT, GCC_SE4_HALT,
+ 	};
+-	bool ok = true;
+ 	for (unsigned i = 0; i < sizeof(halts) / sizeof(halts[0]); ++i) {
+ 		bool clear = mt_wait_clear(gcc, halts[i], 1u << 31, 1000);
+ 		printf("SWEET MARBLE TOUCH: halt %#x %s value=%#x\n", halts[i],
+ 		    clear ? "clear" : "TIMEOUT", mt_rd(gcc, halts[i]));
+-		ok &= clear;
+ 	}
+-	return ok;
+ }
+ 
+ static void
+@@ -221,33 +256,180 @@
+ static void
+ mt_pins(vm_offset_t gpio)
+ {
+-	printf("SWEET MARBLE TOUCH: TLMM read in 2s\n");
+-	mt_wait(2000);
++	printf("SWEET MARBLE TOUCH: TLMM %#x read in 1s\n", MARBLE_TLMM_PA);
++	mt_wait(1000);
+ 	for (unsigned pin = 16; pin <= 21; ++pin) {
+ 		printf("SWEET MARBLE TOUCH: gpio%u cfg=%#x io=%#x\n", pin,
+ 		    mt_rd(gpio, GPIO_CFG(pin)), mt_rd(gpio, GPIO_IO(pin)));
++		mt_wait(500);
+ 	}
+ 
+-	/* SE4 SPI: pins 16..19, function index 1 (qup4 on this pingroup). */
++	printf("SWEET MARBLE TOUCH: writing SPI pins in 1s\n");
++	mt_wait(1000);
+ 	for (unsigned pin = 16; pin <= 19; ++pin) {
+ 		mt_gpio(gpio, pin, 1, 0, 2, false, false);
+ 	}
+-	printf("SWEET MARBLE TOUCH: spi pins cfg16..19=%#x/%#x/%#x/%#x\n",
++	printf("SWEET MARBLE TOUCH: spi cfg16..19=%#x/%#x/%#x/%#x\n",
+ 	    mt_rd(gpio, GPIO_CFG(16)), mt_rd(gpio, GPIO_CFG(17)),
+ 	    mt_rd(gpio, GPIO_CFG(18)), mt_rd(gpio, GPIO_CFG(19)));
++	mt_wait(1000);
+ 
+-	/* GPIO20 reset (active low), GPIO21 IRQ input, both pull-up. */
++	printf("SWEET MARBLE TOUCH: reset low in 1s\n");
++	mt_wait(1000);
+ 	mt_gpio(gpio, 20, 0, 3, 3, true, false);
+ 	mt_gpio(gpio, 21, 0, 3, 3, false, false);
+-	mt_wait(5);
++	mt_wait(10);
++	printf("SWEET MARBLE TOUCH: reset low gpio20 io=%#x cfg=%#x gpio21 io=%#x cfg=%#x\n",
++	    mt_rd(gpio, GPIO_IO(20)), mt_rd(gpio, GPIO_CFG(20)),
++	    mt_rd(gpio, GPIO_IO(21)), mt_rd(gpio, GPIO_CFG(21)));
++	mt_wait(1000);
++
+ 	mt_gpio(gpio, 20, 0, 3, 3, true, true);
+ 	mt_wait(100);
+-	printf("SWEET MARBLE TOUCH: gpio20 cfg=%#x io=%#x gpio21 cfg=%#x io=%#x\n",
+-	    mt_rd(gpio, GPIO_CFG(20)), mt_rd(gpio, GPIO_IO(20)),
+-	    mt_rd(gpio, GPIO_CFG(21)), mt_rd(gpio, GPIO_IO(21)));
++	printf("SWEET MARBLE TOUCH: reset high gpio20 io=%#x gpio21 io=%#x\n",
++	    mt_rd(gpio, GPIO_IO(20)), mt_rd(gpio, GPIO_IO(21)));
++	mt_wait(1000);
++}
++
++static void
++mt_rpmh_probe(void)
++{
++	vm_offset_t rsc = ml_io_map(MARBLE_RSC_PA, 0x10000);
++	vm_offset_t tcs = ml_io_map(MARBLE_TCS_PA, 0x3000);
++	if (!rsc || !tcs) {
++		printf("SWEET MARBLE TOUCH: RPMH map failed rsc=%#lx tcs=%#lx\n",
++		    (unsigned long)rsc, (unsigned long)tcs);
++		return;
++	}
++	printf("SWEET MARBLE TOUCH: RPMH read in 2s\n");
++	mt_wait(2000);
++	uint32_t id = mt_rd(rsc, 0);
++	uint32_t cfg = mt_rd(rsc, 0x0c);
++	printf("SWEET MARBLE TOUCH: RPMH id=%#x major=%u minor=%u cfg=%#x tcs_drv2=%u ncpt=%u\n",
++	    id, (id >> 16) & 0xffu, (id >> 8) & 0xffu, cfg,
++	    (cfg >> 12) & 0x3fu, (cfg >> 27) & 0x1fu);
++	for (unsigned t = 0; t < 3; ++t) {
++		uint32_t b = t * 0x2a0u;
++		printf("SWEET MARBLE TOUCH: tcs%u regs:", t);
++		for (unsigned off = 0; off < 0x30; off += 4) {
++			printf(" %#x", mt_rd(tcs, b + off));
++		}
++		printf("\n");
++		mt_wait(500);
++	}
+ }
+ 
+ static void
++mt_spi_init(vm_offset_t se)
++{
++	uint32_t fw = mt_rd(se, SE_FW);
++	uint32_t dis = mt_rd(se, SE_IF_DISABLE);
++	printf("SWEET MARBLE TOUCH: SPI init fw=%#x proto=%u if_dis=%#x\n",
++	    fw, (fw >> 8) & 0xffu, dis);
++	mt_wait(1000);
++
++	mt_wr(se, SE_M_CMD_CTRL, 2);      /* abort anything inherited */
++	mt_wr(se, GENI_GSI_EVENT_EN, 0);
++	mt_wr(se, 0x644, 0);
++	mt_wr(se, SE_M_IRQ_EN, M_COMMON_IRQ_EN | M_CMD_DONE);
++	mt_wr(se, GENI_IRQ_EN_TOPBIT, 0);
++	mt_wr(se, GENI_CGC_CTRL, mt_rd(se, GENI_CGC_CTRL) | 0x7fu);
++	mt_wr(se, GENI_DMA_GEN_CFG, mt_rd(se, GENI_DMA_GEN_CFG) | 0x0fu);
++	mt_wr(se, GENI_OUTPUT_CTRL, 0x7fu);
++	mt_wr(se, GENI_FORCE_DEFAULT, 1);
++	mt_wr(se, GENI_DMA_MODE_EN, 0);
++	mt_wr(se, SE_SPI_CPHA, 0);
++	mt_wr(se, SE_SPI_LOOPBACK, 0);
++	mt_wr(se, SE_SPI_CPOL, 0);
++	mt_wr(se, SE_SPI_DEMUX_INV, 0);
++	mt_wr(se, SE_SPI_DEMUX_SEL, 0);
++	mt_wr(se, SE_SPI_TRANS_CFG, mt_rd(se, SE_SPI_TRANS_CFG) & ~SE_SPI_CS_TOGGLE);
++	mt_wr(se, SE_SPI_WORD_LEN, 4);    /* 8-bit words */
++	mt_wr(se, GENI_BYTE_GRAN, 0);
++	mt_wr(se, GENI_TX_PACK_CFG0, 0x0007f8feu);
++	mt_wr(se, GENI_TX_PACK_CFG1, 0x000ffefeu);
++	mt_wr(se, GENI_RX_PACK_CFG0, 0x0007f8feu);
++	mt_wr(se, GENI_RX_PACK_CFG1, 0x000ffefeu);
++	mt_wr(se, SE_M_CLK_CFG, (2u << 4) | 1u);   /* XO/2, ~9.6 MHz */
++	mt_wr(se, SE_CLK_SEL, 0);
++	mt_wr(se, GENI_TX_WM, 0);
++	mt_wr(se, GENI_RX_WM, 13);
++	mt_wr(se, GENI_RX_RFR_WM, 14);
++	mt_wr(se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	mt_wr(se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	mt_wait(1000);
++	printf("SWEET MARBLE TOUCH: SPI init done mclk=%#x word=%#x pack=%#x/%#x/%#x/%#x gran=%#x status=%#x\n",
++	    mt_rd(se, SE_M_CLK_CFG), mt_rd(se, SE_SPI_WORD_LEN),
++	    mt_rd(se, GENI_TX_PACK_CFG0), mt_rd(se, GENI_TX_PACK_CFG1),
++	    mt_rd(se, GENI_RX_PACK_CFG0), mt_rd(se, GENI_RX_PACK_CFG1),
++	    mt_rd(se, GENI_BYTE_GRAN), mt_rd(se, SE_STATUS));
++}
++
++static void
++mt_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, unsigned len,
++    const char *tag)
++{
++	if (len == 0 || len > 64) {
++		return;
++	}
++	for (unsigned i = 0; i < 64 && (mt_rd(se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)mt_rd(se, SE_RX_FIFO);
++	}
++	mt_wr(se, GENI_TX_WM, 0);
++	mt_wr(se, SE_SPI_TX_LEN, len);
++	mt_wr(se, SE_SPI_RX_LEN, len);
++	mt_wr(se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	/* Prefill the TX FIFO: 4 SPI bytes per 32-bit FIFO word. */
++	for (unsigned i = 0; i < len; i += 4) {
++		uint32_t word = 0;
++		for (unsigned j = 0; j < 4 && i + j < len; ++j) {
++			word |= (uint32_t)tx[i + j] << (8u * j);
++		}
++		mt_wr(se, SE_TX_FIFO, word);
++	}
++	printf("SWEET MARBLE TOUCH: SPI %s start len=%u txcount=%#x rxcount=%#x status=%#x\n",
++	    tag, len, mt_rd(se, SE_TX_COUNT), mt_rd(se, SE_RX_COUNT),
++	    mt_rd(se, SE_STATUS));
++	mt_wait(500);
++	mt_wr(se, SE_M_CMD0, (3u << 27) | (1u << 2));   /* TX+RX, fragment */
++	uint32_t irq = 0;
++	bool done = false;
++	for (unsigned i = 0; i < 2000; ++i) {
++		irq = mt_rd(se, SE_M_IRQ_STATUS);
++		if (irq & M_CMD_ERRORS) {
++			break;
++		}
++		if (irq & M_CMD_DONE) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	uint32_t count = mt_rd(se, SE_RX_COUNT) & 0x1ffffffu;
++	unsigned got = 0;
++	if (count > 32) {
++		count = 32;
++	}
++	for (unsigned i = 0; i < count; ++i) {
++		uint32_t word = mt_rd(se, SE_RX_FIFO);
++		for (unsigned j = 0; j < 4 && got < len; ++j) {
++			rx[got++] = (uint8_t)(word >> (8u * j));
++		}
++	}
++	printf("SWEET MARBLE TOUCH: SPI %s done=%d irq=%#x rxcount=%u got=%u status=%#x txc=%#x\n",
++	    tag, done ? 1 : 0, irq, count, got, mt_rd(se, SE_STATUS),
++	    mt_rd(se, SE_TX_COUNT));
++	printf("SWEET MARBLE TOUCH: SPI %s rx:", tag);
++	for (unsigned i = 0; i < got; ++i) {
++		printf(" %02x", rx[i]);
++	}
++	printf("\n");
++	mt_wr(se, SE_M_CMD_CTRL, 2);
++	mt_wr(se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	mt_wait(500);
++}
++
++static void
+ marble_touch_thread(void *arg, wait_result_t result)
+ {
+ 	int enabled = 0;
+@@ -260,7 +442,7 @@
+ 		printf("SWEET MARBLE TOUCH: disabled (marble_touch=0)\n");
+ 		goto out;
+ 	}
+-	printf("SWEET MARBLE TOUCH: stage-2 start in 15s\n");
++	printf("SWEET MARBLE TOUCH: stage-3 start in 15s\n");
+ 	mt_wait(15000);
+ 
+ 	gcc = ml_io_map(MARBLE_GCC_PA, MARBLE_GCC_SIZE);
+@@ -273,18 +455,20 @@
+ 		goto out;
+ 	}
+ 
+-	bool clocks_ok = mt_clocks(gcc);
+-	printf("SWEET MARBLE TOUCH: clocks %s\n", clocks_ok ? "ok" : "incomplete");
+-
+-	/* First SE access: did the clock votes make the block reachable? */
++	mt_clocks(gcc);
+ 	mt_se_report(se, "after-clock");
+-
+ 	mt_pins(gpio);
++	mt_rpmh_probe();
++	mt_spi_init(se);
+ 
+-	/* Reset released; read the SE again (the IC is still unpowered). */
+-	mt_se_report(se, "after-reset");
++	uint8_t tx[12] = {
++		0xf1, 0x00, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++		0x00, 0x00, 0x00,
++	};
++	uint8_t rx[12] = {0};
++	mt_spi_xfer(se, tx, rx, sizeof(tx), "test");
+ 
+-	printf("SWEET MARBLE TOUCH: stage-2 done\n");
++	printf("SWEET MARBLE TOUCH: stage-3 done\n");
+ 
+ out:
+ 	(void)thread_terminate(current_thread());

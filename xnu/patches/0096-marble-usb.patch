@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -77,11 +77,15 @@
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
++	int marble = 0;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	/* marbleusb=1: skip the sweet GCC clock gate and the QUSB2 PHY block
++	 * (marble uses eUSB2 at 0x88e3000; 0x88e2000 is only an EUD register). */
++	PE_parse_boot_argn("marbleusb", &marble, sizeof(marble));
+ 	if (!enabled) {
+ 		return;
+ 	}
+@@ -98,7 +102,11 @@
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	clocks_on = marble ? true :
++	    ((gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF));
++	if (marble) {
++		printf("SWEET USB: marble mode, sweet clock gate ignored\n");
++	}
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+@@ -118,6 +126,10 @@
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
++	}
++	if (marble) {
++		printf("SWEET USB: marble eUSB2 PHY left to ABL\n");
++		return;
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");

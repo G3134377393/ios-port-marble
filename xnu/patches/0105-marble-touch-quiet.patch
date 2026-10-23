@@ -1,0 +1,53 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -390,6 +390,8 @@
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("marble_touch", &enabled, sizeof(enabled));
++	int dbg = 0;
++	(void)PE_parse_boot_argn("marble_touch_dbg", &dbg, sizeof(dbg));
+ 	if (!enabled) {
+ 		printf("SWEET MARBLE TOUCH: disabled (marble_touch=0)\n");
+ 		goto out;
+@@ -517,7 +519,7 @@
+ 	}
+ 	printf("SWEET MARBLE TOUCH: polling IRQ gpio21\n");
+ 	for (unsigned iter = 0; ; ++iter) {
+-		if ((iter % 500) == 0) {
++		if (dbg && (iter % 500) == 0) {
+ 			printf("SWEET MARBLE TOUCH: poll iter=%u irq=%u tda=%#x\n",
+ 			    iter, mt_rd(gpio, GPIO_IO(21)) & 1u, tda);
+ 		}
+@@ -529,12 +531,14 @@
+ 		memset(ev, 0, sizeof(ev));
+ 		bb_read(gpio, clk, mosi, miso, tda, ev, 26);
+ 		uint8_t status = ev[0];
+-		printf("SWEET MARBLE TOUCH: ev st=%02x %02x tn=%u hdr:",
+-		    ev[0], ev[1], ev[2] & 0x0fu);
+-		for (unsigned i = 3; i < 8; ++i) {
+-			printf(" %02x", ev[i]);
++		if (dbg) {
++			printf("SWEET MARBLE TOUCH: ev st=%02x %02x tn=%u hdr:",
++			    ev[0], ev[1], ev[2] & 0x0fu);
++			for (unsigned i = 3; i < 8; ++i) {
++				printf(" %02x", ev[i]);
++			}
++			printf("\n");
+ 		}
+-		printf("\n");
+ 		if (status == 0) {
+ 			mt_wait(2);
+ 			continue;
+@@ -579,8 +583,10 @@
+ 						 * 23999 for the 1080x2400 panel. */
+ 						int sx = x / 10;
+ 						int sy = y / 10;
+-						printf("SWEET MARBLE TOUCH: pt%d id=%u type=%u x=%d y=%d w=%d -> %d,%d\n",
+-						    i, id, type, x, y, w, sx, sy);
++						if (dbg) {
++							printf("SWEET MARBLE TOUCH: pt%d id=%u type=%u x=%d y=%d w=%d -> %d,%d\n",
++							    i, id, type, x, y, w, sx, sy);
++						}
+ 						if (id < 10 && type != 1 && type != 3) {
+ 							lastx[id] = sx;
+ 							lasty[id] = sy;

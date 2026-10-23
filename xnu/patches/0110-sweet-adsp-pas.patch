@@ -1,11 +1,12 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,5 +112,6 @@
+@@ -112,5 +112,7 @@
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
  bsd/dev/sweet_audio.c			standard
 +bsd/dev/sweet_adsp.c			standard
++bsd/dev/sweet_glink.c			standard
  bsd/dev/mem.c				standard
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
@@ -29,7 +30,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adsp.c
-@@ -0,0 +1,701 @@
+@@ -0,0 +1,710 @@
 +/*
 + * SWEET: minimal ADSP (Q6) bring-up for marble.
 + *
@@ -71,6 +72,7 @@
 +    vm_offset_t end, vm_prot_t prot, unsigned int flags);
 +extern kern_return_t thread_terminate(thread_t);
 +void sweet_adsp_init(void);
++void sweet_glink_probe(void);
 +
 +#define PAS_ID          1
 +#define ADSP_REGION_PA  0x9fd00000u     /* live DT adsp_region@9fd00000 */
@@ -670,6 +672,14 @@
 +	sa_wait(3000);
 +
 +	/*
++	 * 6b. Optional GLINK/GPR client.  This is what turns the released Q6
++	 * into a usable service: it opens the adsp_apps channel and asks
++	 * q6prm to vote the LPASS audio core on, which is the precondition
++	 * for any LPASS macro/TDM register access from the AP.
++	 */
++	sweet_glink_probe();
++
++	/*
 +	 * 7. Optional LPASS probes.  Both fault (panic) if the block is still
 +	 * XPU-protected, so they are opt-in: the PAS load itself is complete by
 +	 * here and a normal boot must not die on a diagnostic read.
@@ -731,3 +741,1018 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 +
 +/* SCM calls follow the Linux qcom_scm a6 resume protocol. */
+--- /dev/null
++++ b/bsd/dev/sweet_glink.c
+@@ -0,0 +1,1012 @@
++/*
++ * SWEET: minimal GLINK-over-SMEM client for the ADSP GPR router.
++ *
++ * sweet_adsp.c releases the Q6 through TZ PAS.  This file adds just enough of
++ * the GLINK wire protocol to open the "adsp_apps" channel and send one GPR
++ * packet to the q6prm service, asking it to vote for the LPASS audio hardware
++ * core.  LPASS register blocks (RX macro 0x03200000, CDC, TDM) only answer the
++ * AP after that vote, so this is the gate in front of any sound output.
++ *
++ * Facts from the live DTS and the Linux drivers:
++ *   SMEM           0x80900000 + 2 MiB; partition table in the last 4 KiB ($TOC)
++ *   GLINK items    478 descriptor, 479 AP->ADSP FIFO, 480 ADSP->AP FIFO
++ *   IPCC           0xed18000, SEND_ID at +0x0c, LPASS client 3, signal 0
++ *   GPR domains    ADSP 2, APPS 3; q6prm service 7, module IID 2
++ *   q6prm vote     opcode 0x0100100F, PARAM_ID_RSC_HW_CORE 0x08001032
++ *
++ * Every access to shared memory is a 32-bit volatile access: the region is
++ * mapped Device, and XNU's memcpy does unaligned ldp/stp which faults there.
++ *
++ * Gated by sweetglink=1.  Register reads after the vote additionally need
++ * sweetglinkread=1, because a fault there panics.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start,
++    vm_offset_t end, vm_prot_t prot, unsigned int flags);
++void sweet_glink_probe(void);
++
++#define G_SMEM_PA       0x80900000u
++#define G_SMEM_SZ       0x00200000u
++#define G_TOC_OFF       (G_SMEM_SZ - 0x1000u)
++#define G_PFN_MASK      0x3fffu
++
++#define G_IPCC_PA       0xed18000u
++#define G_IPCC_SEND_ID  0x0cu
++#define G_IPCC_ADSP     3u
++
++#define G_LPASS_RX_PA   0x03200000u     /* RX macro */
++#define G_LPASS_VA_PA   0x033f0000u     /* VA macro */
++
++/* GLINK commands */
++#define CMD_VERSION             0
++#define CMD_VERSION_ACK         1
++#define CMD_OPEN                2
++#define CMD_CLOSE               3
++#define CMD_OPEN_ACK            4
++#define CMD_INTENT              5
++#define CMD_RX_DONE             6
++#define CMD_RX_INTENT_REQ       7
++#define CMD_RX_INTENT_REQ_ACK   8
++#define CMD_TX_DATA             9
++#define CMD_CLOSE_ACK           11
++#define CMD_TX_DATA_CONT        12
++#define CMD_READ_NOTIF          13
++#define CMD_RX_DONE_W_REUSE     14
++
++#define GLINK_VERSION_1         1u
++#define GLINK_FEATURE_REUSE     1u      /* GLINK_FEATURE_INTENT_REUSE */
++
++#define G_LINK_NAME             "adsp_apps"
++#define G_LINK_NAME_LEN         11u
++
++#define G_NINTENTS              8
++#define G_INTENT_SIZE           1024u
++#define G_FIFO_RESERVE          16u     /* FIFO_FULL_RESERVE + TX_BLOCKED */
++
++/* GPR / AudioReach */
++#define GPR_DOMAIN_ADSP         2u
++#define GPR_DOMAIN_APPS         3u
++#define GPR_PRM_SERVICE         7u
++#define GPR_PRM_MODULE          2u
++
++#define PRM_CMD_REQUEST_HW_RSC      0x0100100Fu
++#define PARAM_ID_RSC_HW_CORE        0x08001032u
++#define Q6PRM_HW_CORE_LPASS         1u
++
++static vm_offset_t g_smem;
++static vm_offset_t g_ipcc;
++static int        g_chan;
++
++/* SMEM item locations (offsets from the SMEM base). */
++static uint32_t g_desc_off, g_desc_len;
++static uint32_t g_tx_off, g_tx_len;
++static uint32_t g_rx_off, g_rx_len;
++
++/* Channel state. */
++static uint32_t g_lcid = 1;
++static uint32_t g_rcid;
++static int      g_ver_acked;
++static int      g_open_acked;
++static int      g_remote_open;
++
++struct g_riid {
++	uint32_t id;
++	uint32_t size;
++	uint32_t in_use;
++};
++
++struct g_liid {
++	uint32_t id;
++	uint32_t size;
++	uint32_t filled;
++	uint8_t  buf[G_INTENT_SIZE];
++};
++
++static struct g_riid g_riids[G_NINTENTS];
++static int           g_nriids;
++static struct g_liid g_liids[G_NINTENTS];
++static int           g_nliids;
++
++/* Last assembled GPR packet. */
++static uint8_t  g_rsp[G_INTENT_SIZE];
++static uint32_t g_rsp_len;
++static int      g_rsp_ready;
++
++static void
++g_wait(unsigned ms)
++{
++	uint64_t deadline;
++
++	if (ms == 0) {
++		return;
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static vm_offset_t
++g_win_alloc(vm_size_t size)
++{
++	vm_offset_t va = 0;
++
++	if (kmem_alloc(kernel_map, &va, size, KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	return va;
++}
++
++static vm_offset_t
++g_win_map(vm_offset_t win, uint64_t pa, vm_size_t size)
++{
++	uint64_t base = pa & ~(uint64_t)G_PFN_MASK;
++	uint32_t off = (uint32_t)(pa - base);
++	vm_size_t span = (off + size + G_PFN_MASK) & ~G_PFN_MASK;
++
++	pmap_remove(kernel_pmap, win, win + span);
++	pmap_map(win, (vm_offset_t)base, (vm_offset_t)(base + span),
++	    VM_PROT_READ | VM_PROT_WRITE, VM_WIMG_IO);
++	return win + off;
++}
++
++static void
++g_win_free(vm_offset_t win, vm_size_t size)
++{
++	pmap_remove(kernel_pmap, win, win + size);
++	kmem_free(kernel_map, win, size);
++}
++
++/* ---- Device-memory accessors (32-bit) ---- */
++
++static uint32_t
++g_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(g_smem + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++g_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(g_smem + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint16_t
++g_rd16(uint32_t off)
++{
++	uint32_t v = g_rd(off & ~3u);
++
++	return (uint16_t)(v >> (8u * (off & 3u)));
++}
++
++static void
++g_fifo_read(uint32_t base, uint32_t len, uint32_t pos,
++    uint8_t *dst, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w = g_rd(base + ((pos + i) % len));
++		uint32_t k = (n - i) < 4 ? (n - i) : 4;
++
++		for (uint32_t b = 0; b < k; b++) {
++			dst[i + b] = (uint8_t)(w >> (8u * b));
++		}
++	}
++}
++
++static void
++g_fifo_write(uint32_t base, uint32_t len, uint32_t pos,
++    const uint8_t *src, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w = 0;
++		uint32_t k = (n - i) < 4 ? (n - i) : 4;
++
++		for (uint32_t b = 0; b < k; b++) {
++			w |= (uint32_t)src[i + b] << (8u * b);
++		}
++		/* head and lengths are 8-byte aligned, words never straddle */
++		g_wr(base + ((pos + i) % len), w);
++	}
++}
++
++static uint32_t
++g_rx_avail(void)
++{
++	uint32_t head = g_rd(g_desc_off + 12);
++	uint32_t tail = g_rd(g_desc_off + 8);
++
++	if (head < tail) {
++		return g_rx_len - tail + head;
++	}
++	return head - tail;
++}
++
++static void
++g_rx_advance(uint32_t n)
++{
++	uint32_t tail = g_rd(g_desc_off + 8);
++
++	tail = (tail + n) % g_rx_len;
++	g_wr(g_desc_off + 8, tail);
++}
++
++static void
++g_kick(void)
++{
++	if (g_ipcc != 0) {
++		*(volatile uint32_t *)(g_ipcc + G_IPCC_SEND_ID) =
++		    (G_IPCC_ADSP << 16) | 0u;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++/* Send one small GLINK control message (8-byte header + up to 64 bytes). */
++static void
++g_send(uint16_t cmd, uint16_t p1, uint32_t p2, const void *data, uint32_t dlen)
++{
++	uint8_t msg[8 + 64];
++	uint32_t head, msglen;
++
++	if (dlen > 64) {
++		dlen = 64;
++	}
++	msg[0] = (uint8_t)(cmd & 0xff);
++	msg[1] = (uint8_t)(cmd >> 8);
++	msg[2] = (uint8_t)(p1 & 0xff);
++	msg[3] = (uint8_t)(p1 >> 8);
++	msg[4] = (uint8_t)(p2 & 0xff);
++	msg[5] = (uint8_t)(p2 >> 8);
++	msg[6] = (uint8_t)(p2 >> 16);
++	msg[7] = (uint8_t)(p2 >> 24);
++	if (data != NULL && dlen != 0) {
++		for (uint32_t i = 0; i < dlen; i++) {
++			msg[8 + i] = ((const uint8_t *)data)[i];
++		}
++	}
++	msglen = 8 + dlen;
++	head = g_rd(g_desc_off + 4);
++	g_fifo_write(g_tx_off, g_tx_len, head, msg, msglen);
++	head = (head + msglen + 7u) & ~7u;
++	if (head >= g_tx_len) {
++		head -= g_tx_len;
++	}
++	g_wr(g_desc_off + 4, head);
++	g_kick();
++}
++
++/* Send a GLINK data message (16-byte header + up to 128 bytes). */
++static void
++g_send_tx_data(uint32_t iid, const uint8_t *pkt, uint32_t len)
++{
++	uint8_t msg[16 + 128];
++	uint32_t head;
++
++	if (len > 128) {
++		len = 128;
++	}
++	msg[0] = CMD_TX_DATA;
++	msg[1] = 0;
++	msg[2] = (uint8_t)(g_lcid & 0xff);
++	msg[3] = (uint8_t)(g_lcid >> 8);
++	msg[4] = (uint8_t)(iid & 0xff);
++	msg[5] = (uint8_t)(iid >> 8);
++	msg[6] = (uint8_t)(iid >> 16);
++	msg[7] = (uint8_t)(iid >> 24);
++	msg[8] = (uint8_t)(len & 0xff);
++	msg[9] = (uint8_t)(len >> 8);
++	msg[10] = (uint8_t)(len >> 16);
++	msg[11] = (uint8_t)(len >> 24);
++	msg[12] = 0;
++	msg[13] = 0;
++	msg[14] = 0;
++	msg[15] = 0;
++	for (uint32_t i = 0; i < len; i++) {
++		msg[16 + i] = pkt[i];
++	}
++	head = g_rd(g_desc_off + 4);
++	g_fifo_write(g_tx_off, g_tx_len, head, msg, 16 + len);
++	head = (head + 16 + len + 7u) & ~7u;
++	if (head >= g_tx_len) {
++		head -= g_tx_len;
++	}
++	g_wr(g_desc_off + 4, head);
++	g_kick();
++}
++
++static void
++g_send_version(void)
++{
++	g_send(CMD_VERSION, (uint16_t)GLINK_VERSION_1, GLINK_FEATURE_REUSE,
++	    NULL, 0);
++}
++
++static void
++g_send_open(void)
++{
++	uint8_t name[16];
++
++	for (uint32_t i = 0; i < sizeof(name); i++) {
++		name[i] = 0;
++	}
++	for (uint32_t i = 0; i < G_LINK_NAME_LEN; i++) {
++		name[i] = (uint8_t)G_LINK_NAME[i];
++	}
++	g_send(CMD_OPEN, (uint16_t)g_lcid, G_LINK_NAME_LEN, name,
++	    G_LINK_NAME_LEN);
++}
++
++static void
++g_send_open_ack(uint32_t rcid)
++{
++	g_send(CMD_OPEN_ACK, (uint16_t)rcid, 0, NULL, 0);
++}
++
++static void
++g_advertise_intent(uint32_t id, uint32_t size)
++{
++	uint8_t buf[8];
++
++	buf[0] = (uint8_t)(size & 0xff);
++	buf[1] = (uint8_t)(size >> 8);
++	buf[2] = (uint8_t)(size >> 16);
++	buf[3] = (uint8_t)(size >> 24);
++	buf[4] = (uint8_t)(id & 0xff);
++	buf[5] = (uint8_t)(id >> 8);
++	buf[6] = (uint8_t)(id >> 16);
++	buf[7] = (uint8_t)(id >> 24);
++	g_send(CMD_INTENT, (uint16_t)g_lcid, 1, buf, 8);
++}
++
++static struct g_riid *
++g_pick_riid(uint32_t len)
++{
++	struct g_riid *best = NULL;
++
++	for (int i = 0; i < g_nriids; i++) {
++		struct g_riid *r = &g_riids[i];
++
++		if (r->in_use || r->size < len) {
++			continue;
++		}
++		if (best == NULL || r->size > best->size) {
++			best = r;
++		}
++	}
++	return best;
++}
++
++static int
++g_rx_one(void)
++{
++	uint8_t hdr[16];
++	uint8_t tmp[64];
++	uint32_t avail = g_rx_avail();
++	uint32_t tail = g_rd(g_desc_off + 8);
++	uint16_t cmd, p1;
++	uint32_t p2;
++
++	if (avail < 8) {
++		return -1;
++	}
++	g_fifo_read(g_rx_off, g_rx_len, tail, hdr, 8);
++	cmd = (uint16_t)(hdr[0] | (hdr[1] << 8));
++	p1 = (uint16_t)(hdr[2] | (hdr[3] << 8));
++	p2 = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
++	    ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
++
++	switch (cmd) {
++	case CMD_VERSION:
++		printf("SWEET GLINK: remote VERSION %u features %#x\n", p1, p2);
++		g_send(CMD_VERSION_ACK, GLINK_VERSION_1, GLINK_FEATURE_REUSE,
++		    NULL, 0);
++		g_ver_acked = 1;
++		g_rx_advance(8);
++		break;
++
++	case CMD_VERSION_ACK:
++		printf("SWEET GLINK: VERSION_ACK %u features %#x\n", p1, p2);
++		g_ver_acked = 1;
++		g_rx_advance(8);
++		break;
++
++	case CMD_OPEN: {
++		uint32_t n = p2;
++
++		if (n > 32) {
++			n = 32;
++		}
++		if (avail < 8 + n) {
++			return -1;
++		}
++		g_fifo_read(g_rx_off, g_rx_len, tail + 8, tmp, n);
++		tmp[n] = 0;
++		printf("SWEET GLINK: remote OPEN rcid=%u name=%s\n", p1, tmp);
++		g_rcid = p1;
++		g_remote_open = 1;
++		g_rx_advance((8 + n + 7u) & ~7u);
++		break;
++	}
++
++	case CMD_OPEN_ACK:
++		printf("SWEET GLINK: OPEN_ACK lcid=%u\n", p1);
++		g_open_acked = 1;
++		g_rx_advance(8);
++		break;
++
++	case CMD_INTENT: {
++		uint32_t count = p2;
++
++		if (count > 8) {
++			count = 8;
++		}
++		if (avail < 8 + count * 8) {
++			return -1;
++		}
++		g_fifo_read(g_rx_off, g_rx_len, tail + 8, tmp, count * 8);
++		for (uint32_t i = 0; i < count; i++) {
++			uint32_t size = (uint32_t)tmp[i * 8] |
++			    ((uint32_t)tmp[i * 8 + 1] << 8) |
++			    ((uint32_t)tmp[i * 8 + 2] << 16) |
++			    ((uint32_t)tmp[i * 8 + 3] << 24);
++			uint32_t id = (uint32_t)tmp[i * 8 + 4] |
++			    ((uint32_t)tmp[i * 8 + 5] << 8) |
++			    ((uint32_t)tmp[i * 8 + 6] << 16) |
++			    ((uint32_t)tmp[i * 8 + 7] << 24);
++
++			printf("SWEET GLINK: remote intent id=%u size=%u\n",
++			    id, size);
++			if (g_nriids < G_NINTENTS) {
++				g_riids[g_nriids].id = id;
++				g_riids[g_nriids].size = size;
++				g_riids[g_nriids].in_use = 0;
++				g_nriids++;
++			}
++		}
++		g_rx_advance((8 + count * 8 + 7u) & ~7u);
++		break;
++	}
++
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		for (int i = 0; i < g_nliids; i++) {
++			if (g_liids[i].id == p2) {
++				g_liids[i].filled = 0;
++			}
++		}
++		g_rx_advance(8);
++		break;
++
++	case CMD_RX_INTENT_REQ:
++		printf("SWEET GLINK: remote wants intent size=%u\n", p2);
++		g_send(CMD_RX_INTENT_REQ_ACK, (uint16_t)g_lcid, 1, NULL, 0);
++		g_rx_advance(8);
++		break;
++
++	case CMD_RX_INTENT_REQ_ACK:
++		printf("SWEET GLINK: intent req ack granted=%u\n", p2);
++		g_rx_advance(8);
++		break;
++
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t chunk, left, liid;
++
++		if (avail < 16) {
++			return -1;
++		}
++		g_fifo_read(g_rx_off, g_rx_len, tail, hdr, 16);
++		chunk = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
++		    ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
++		left = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) |
++		    ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
++		liid = p2;
++		if (avail < 16 + chunk) {
++			return -1;
++		}
++		for (int i = 0; i < g_nliids; i++) {
++			if (g_liids[i].id != liid) {
++				continue;
++			}
++			if (g_liids[i].filled + chunk <= g_liids[i].size) {
++				g_fifo_read(g_rx_off, g_rx_len, tail + 16,
++				    g_liids[i].buf + g_liids[i].filled, chunk);
++				g_liids[i].filled += chunk;
++			}
++			if (left == 0) {
++				g_rsp_len = g_liids[i].filled;
++				if (g_rsp_len > sizeof(g_rsp)) {
++					g_rsp_len = sizeof(g_rsp);
++				}
++				for (uint32_t k = 0; k < g_rsp_len; k++) {
++					g_rsp[k] = g_liids[i].buf[k];
++				}
++				g_rsp_ready = 1;
++				g_liids[i].filled = 0;
++				/* RX_DONE carries the *local* channel id. */
++				g_send(CMD_RX_DONE_W_REUSE,
++				    (uint16_t)g_lcid, liid, NULL, 0);
++			}
++			break;
++		}
++		g_rx_advance((16 + chunk + 7u) & ~7u);
++		break;
++	}
++
++	case CMD_READ_NOTIF:
++		g_kick();
++		g_rx_advance(8);
++		break;
++
++	case CMD_CLOSE:
++	case CMD_CLOSE_ACK:
++		printf("SWEET GLINK: close cmd %u p1=%u\n", cmd, p1);
++		g_rx_advance(8);
++		break;
++
++	default:
++		printf("SWEET GLINK: unknown cmd %u p1=%u p2=%#x\n", cmd, p1, p2);
++		g_rx_advance(8);
++		break;
++	}
++	return 0;
++}
++
++/* Drain incoming messages for up to budget_ms; returns messages seen. */
++static int
++g_drain(unsigned budget_ms)
++{
++	int seen = 0;
++	unsigned waited = 0;
++
++	for (;;) {
++		int got = 0;
++
++		while (g_rx_one() == 0) {
++			seen++;
++			got++;
++		}
++		if (waited >= budget_ms) {
++			break;
++		}
++		if (!got) {
++			g_wait(5);
++			waited += 5;
++		}
++	}
++	return seen;
++}
++
++static int
++g_wait_flag(const int *flag, unsigned ms)
++{
++	unsigned i = 0;
++
++	while (i < ms) {
++		g_drain(0);
++		if (*flag) {
++			return 1;
++		}
++		g_wait(5);
++		i += 5;
++	}
++	g_drain(0);
++	return *flag;
++}
++
++static int
++g_wait_riid(uint32_t len, unsigned ms)
++{
++	unsigned i = 0;
++
++	while (i < ms) {
++		if (g_pick_riid(len) != NULL) {
++			return 1;
++		}
++		g_drain(0);
++		g_wait(5);
++		i += 5;
++	}
++	g_drain(0);
++	return g_pick_riid(len) != NULL;
++}
++
++static void
++g_send_gpr(const uint8_t *pkt, uint32_t len)
++{
++	struct g_riid *r;
++
++	if (len > 128) {
++		len = 128;
++	}
++	if (g_pick_riid(len) == NULL) {
++		printf("SWEET GLINK: requesting %u-byte intent\n", len);
++		g_send(CMD_RX_INTENT_REQ, (uint16_t)g_lcid, len, NULL, 0);
++		if (!g_wait_riid(len, 2000)) {
++			printf("SWEET GLINK: no remote intent for %u bytes\n",
++			    len);
++			return;
++		}
++	}
++	r = g_pick_riid(len);
++	if (r == NULL) {
++		return;
++	}
++	r->in_use = 1;
++	g_send_tx_data(r->id, pkt, len);
++}
++
++static void
++g_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v & 0xff);
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++/* PRM "vote for the LPASS hardware core" request. */
++static void
++g_prm_vote_lpass(void)
++{
++	uint8_t pkt[80];
++	uint32_t pkt_size = 24 + 16 + 20;   /* GPR + APM cmd + param */
++
++	for (uint32_t i = 0; i < sizeof(pkt); i++) {
++		pkt[i] = 0;
++	}
++	/* GPR header: version 0, hdr_size 6 words, pkt_size */
++	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
++	g_put32(pkt + 8, GPR_PRM_SERVICE);      /* src_port */
++	g_put32(pkt + 12, GPR_PRM_MODULE);      /* dest_port */
++	g_put32(pkt + 16, 1);                   /* token */
++	g_put32(pkt + 20, PRM_CMD_REQUEST_HW_RSC);
++	/* APM command header */
++	g_put32(pkt + 24 + 0, 0);               /* payload_address_lsw */
++	g_put32(pkt + 24 + 4, 0);               /* payload_address_msw */
++	g_put32(pkt + 24 + 8, 0);               /* mem_map_handle */
++	g_put32(pkt + 24 + 12, 20);             /* payload_size */
++	/* apm_module_param_data + hw_clk_id */
++	g_put32(pkt + 40 + 0, GPR_PRM_MODULE);  /* module_instance_id */
++	g_put32(pkt + 40 + 4, PARAM_ID_RSC_HW_CORE);
++	g_put32(pkt + 40 + 8, 4);               /* param_size */
++	g_put32(pkt + 40 + 12, 0);              /* error_code */
++	g_put32(pkt + 40 + 16, Q6PRM_HW_CORE_LPASS);
++
++	printf("SWEET GLINK: PRM vote lpass core (%u bytes)\n", pkt_size);
++	g_send_gpr(pkt, pkt_size);
++}
++
++static void
++g_dump(const char *tag, const uint8_t *p, uint32_t len)
++{
++	char line[80];
++	uint32_t n = len > 64 ? 64 : len;
++
++	printf("SWEET GLINK: %s (%u bytes)\n", tag, len);
++	for (uint32_t off = 0; off < n; off += 16) {
++		static const char hex[] = "0123456789abcdef";
++		int pos = 0;
++		uint32_t k = (n - off) > 16 ? 16 : (n - off);
++
++		for (uint32_t i = 0; i < k; i++) {
++			line[pos++] = hex[p[off + i] >> 4];
++			line[pos++] = hex[p[off + i] & 0xf];
++			line[pos++] = ' ';
++		}
++		line[pos] = 0;
++		printf("SWEET GLINK:   +%02x %s\n", off, line);
++	}
++}
++
++static uint32_t
++g_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* ---- SMEM parsing ---- */
++
++struct g_part {
++	uint32_t off;
++	uint32_t size;
++	uint16_t host0;
++	uint16_t host1;
++	int      ok;
++	int      global;
++};
++
++static int
++g_smem_partition(struct g_part *out)
++{
++	uint32_t num;
++
++	printf("SWEET GLINK: smem sbl version %#x initialized %u\n",
++	    g_rd(0x5c), g_rd(0xc0));
++	if (g_rd(G_TOC_OFF + 0) != 0x434f5424u /* "$TOC" */) {
++		printf("SWEET GLINK: no $TOC at %#x (got %#x)\n",
++		    G_TOC_OFF, g_rd(G_TOC_OFF + 0));
++		return 0;
++	}
++	num = g_rd(G_TOC_OFF + 8);
++	printf("SWEET GLINK: ptable version %u entries %u\n",
++	    g_rd(G_TOC_OFF + 4), num);
++	if (num > 32) {
++		num = 32;
++	}
++	for (uint32_t i = 0; i < num; i++) {
++		uint32_t e = G_TOC_OFF + 32 + i * 48;
++		uint32_t off = g_rd(e + 0);
++		uint32_t size = g_rd(e + 4);
++		uint16_t h0 = g_rd16(e + 12);
++		uint16_t h1 = g_rd16(e + 14);
++
++		if (off == 0 || size == 0) {
++			continue;
++		}
++		printf("SWEET GLINK: part[%u] off=%#x size=%#x hosts=%u,%u\n",
++		    i, off, size, h0, h1);
++		if (out->ok == 0 && h0 == 0 && h1 == 2) {
++			out->off = off;
++			out->size = size;
++			out->host0 = h0;
++			out->host1 = h1;
++			out->ok = 1;
++			out->global = 0;
++		} else if (out->ok == 0 && h0 == 0xfffe && h1 == 0xfffe) {
++			out->off = off;
++			out->size = size;
++			out->host0 = h0;
++			out->host1 = h1;
++			out->ok = 1;
++			out->global = 1;
++		}
++	}
++	if (!out->ok) {
++		printf("SWEET GLINK: no AP/ADSP or global partition\n");
++		return 0;
++	}
++	if (g_rd(out->off + 0) != 0x54525024u /* "$PRT" */) {
++		printf("SWEET GLINK: bad partition magic %#x\n",
++		    g_rd(out->off + 0));
++		return 0;
++	}
++	printf("SWEET GLINK: partition %s free_uncached=%#x\n",
++	    out->global ? "global" : "apps/adsp", g_rd(out->off + 12));
++	return 1;
++}
++
++static int
++g_find_item(const struct g_part *p, uint16_t want, uint32_t *data_off,
++    uint32_t *data_len)
++{
++	uint32_t e = p->off + 0x20;
++	uint32_t end = p->off + g_rd(p->off + 12);
++
++	while (e < end) {
++		uint16_t canary = g_rd16(e + 0);
++		uint16_t item = g_rd16(e + 2);
++		uint32_t size = g_rd(e + 4);
++		uint16_t pad_data = g_rd16(e + 8);
++		uint16_t pad_hdr = g_rd16(e + 10);
++
++		if (canary != 0xa5a5) {
++			printf("SWEET GLINK: bad item canary %#x at %#x\n",
++			    canary, e);
++			return 0;
++		}
++		if (item == want) {
++			*data_off = e + 16 + pad_hdr;
++			*data_len = size - pad_data;
++			return 1;
++		}
++		e = e + 16 + pad_hdr + size;
++	}
++	return 0;
++}
++
++static int
++g_smem_init(void)
++{
++	struct g_part part;
++	uint32_t off, len;
++
++	for (uint32_t i = 0; i < sizeof(part); i++) {
++		((uint8_t *)&part)[i] = 0;
++	}
++	g_smem = g_win_alloc(G_SMEM_SZ + PAGE_SIZE);
++	if (g_smem == 0) {
++		printf("SWEET GLINK: no VA for smem\n");
++		return 0;
++	}
++	g_smem = g_win_map(g_smem, G_SMEM_PA, G_SMEM_SZ);
++
++	if (!g_smem_partition(&part)) {
++		return 0;
++	}
++	if (!g_find_item(&part, 478, &off, &len) || len < 32) {
++		printf("SWEET GLINK: item 478 (descriptor) missing\n");
++		return 0;
++	}
++	g_desc_off = off;
++	g_desc_len = len;
++	printf("SWEET GLINK: descriptor %#x (%u bytes): %u %u %u %u\n",
++	    off, len, g_rd(off + 0), g_rd(off + 4), g_rd(off + 8),
++	    g_rd(off + 12));
++
++	if (!g_find_item(&part, 479, &off, &len)) {
++		printf("SWEET GLINK: item 479 (tx fifo) missing\n");
++		return 0;
++	}
++	g_tx_off = off;
++	g_tx_len = len;
++	if (!g_find_item(&part, 480, &off, &len)) {
++		printf("SWEET GLINK: item 480 (rx fifo) missing\n");
++		return 0;
++	}
++	g_rx_off = off;
++	g_rx_len = len;
++	printf("SWEET GLINK: tx %#x (%u) rx %#x (%u)\n",
++	    g_tx_off, g_tx_len, g_rx_off, g_rx_len);
++
++	/* Print the item table so the next run has ground truth. */
++	{
++		uint32_t e = part.off + 0x20;
++		uint32_t end = part.off + g_rd(part.off + 12);
++		int n = 0;
++
++		while (e < end && n < 300) {
++			uint16_t item = g_rd16(e + 2);
++			uint32_t size = g_rd(e + 4);
++
++			if (item > 400) {
++				printf("SWEET GLINK: item %u size %u\n",
++				    item, size);
++			}
++			e = e + 16 + g_rd16(e + 10) + size;
++			n++;
++		}
++		printf("SWEET GLINK: %d items scanned\n", n);
++	}
++	return 1;
++}
++
++static void
++g_lpass_probe(void)
++{
++	int probe = 0;
++
++	(void)PE_parse_boot_argn("sweetglinkread", &probe, sizeof(probe));
++	if (!probe) {
++		printf("SWEET GLINK: lpass read skipped (sweetglinkread=1)\n");
++		return;
++	}
++	{
++		vm_offset_t win = g_win_alloc(0x8000);
++
++		if (win != 0) {
++			vm_offset_t rx = g_win_map(win, G_LPASS_RX_PA, 16);
++
++			printf("SWEET GLINK: rx_macro %08x %08x %08x %08x\n",
++			    *(volatile uint32_t *)(rx + 0x0),
++			    *(volatile uint32_t *)(rx + 0x4),
++			    *(volatile uint32_t *)(rx + 0x8),
++			    *(volatile uint32_t *)(rx + 0xc));
++			g_win_free(win, 0x8000);
++		}
++	}
++	{
++		vm_offset_t win = g_win_alloc(0x8000);
++
++		if (win != 0) {
++			vm_offset_t va = g_win_map(win, G_LPASS_VA_PA, 16);
++
++			printf("SWEET GLINK: va_macro %08x %08x %08x %08x\n",
++			    *(volatile uint32_t *)(va + 0x0),
++			    *(volatile uint32_t *)(va + 0x4),
++			    *(volatile uint32_t *)(va + 0x8),
++			    *(volatile uint32_t *)(va + 0xc));
++			g_win_free(win, 0x8000);
++		}
++	}
++}
++
++void
++sweet_glink_probe(void)
++{
++	int enabled = 0;
++	int rc;
++
++	(void)PE_parse_boot_argn("sweetglink", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET GLINK: disabled (sweetglink=1)\n");
++		return;
++	}
++	printf("SWEET GLINK: ===== minimal GLINK/GPR client =====\n");
++
++	if (!g_smem_init()) {
++		goto out;
++	}
++	if (g_tx_len > 0x10000u || g_rx_len > 0x10000u) {
++		printf("SWEET GLINK: fifo size out of range\n");
++		goto out;
++	}
++
++	g_ipcc = g_win_alloc(PAGE_SIZE);
++	if (g_ipcc != 0) {
++		g_ipcc = g_win_map(g_ipcc, G_IPCC_PA, 0x100);
++	}
++
++	for (int i = 0; i < G_NINTENTS; i++) {
++		g_liids[i].id = (uint32_t)(i + 1);
++		g_liids[i].size = G_INTENT_SIZE;
++	}
++	g_nliids = G_NINTENTS;
++
++	/* Version negotiation. */
++	g_send_version();
++	rc = g_wait_flag(&g_ver_acked, 2000);
++	printf("SWEET GLINK: version %s\n", rc ? "ok" : "TIMEOUT");
++
++	/* Open adsp_apps. */
++	g_send_open();
++	for (unsigned i = 0; i < 400; i += 5) {
++		g_drain(0);
++		if (g_open_acked && g_remote_open) {
++			break;
++		}
++		g_wait(5);
++	}
++	printf("SWEET GLINK: open ack=%d remote_open=%d rcid=%u\n",
++	    g_open_acked, g_remote_open, g_rcid);
++	if (g_open_acked && g_remote_open) {
++		g_send_open_ack(g_rcid);
++		for (int i = 0; i < g_nliids; i++) {
++			g_advertise_intent(g_liids[i].id, g_liids[i].size);
++		}
++		g_drain(50);
++	}
++
++	/* Cast the PRM vote and look at the reply. */
++	g_prm_vote_lpass();
++	for (unsigned i = 0; i < 3000; i += 5) {
++		g_drain(0);
++		if (g_rsp_ready) {
++			break;
++		}
++		g_wait(5);
++	}
++	if (g_rsp_ready) {
++		g_dump("PRM response", g_rsp, g_rsp_len);
++		if (g_rsp_len >= 32) {
++			printf("SWEET GLINK: resp opcode %#x status %#x\n",
++			    g_le32(g_rsp + 24), g_le32(g_rsp + 28));
++		}
++	} else {
++		printf("SWEET GLINK: no PRM response\n");
++	}
++	g_drain(100);
++
++	g_lpass_probe();
++
++out:
++	printf("SWEET GLINK: ===== done =====\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

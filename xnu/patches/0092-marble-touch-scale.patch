@@ -1,0 +1,44 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -394,7 +394,7 @@
+ 		printf("SWEET MARBLE TOUCH: disabled (marble_touch=0)\n");
+ 		goto out;
+ 	}
+-	printf("SWEET MARBLE TOUCH: stage-8 start in 15s\n");
++	printf("SWEET MARBLE TOUCH: stage-9 start in 15s\n");
+ 	mt_wait(15000);
+ 
+ 	gcc = ml_io_map(MARBLE_GCC_PA, MARBLE_GCC_SIZE);
+@@ -575,13 +575,17 @@
+ 						int x = pp[2] | (pp[3] << 8);
+ 						int y = pp[4] | (pp[5] << 8);
+ 						int w = pp[6] | (pp[7] << 8);
+-						printf("SWEET MARBLE TOUCH: pt%d id=%u type=%u x=%d y=%d w=%d\n",
+-						    i, id, type, x, y, w);
+-						if (id < 10 && type != 1 && type != 3) {
+-							lastx[id] = x;
+-							lasty[id] = y;
++						/* GT9916R reports 0.1-pixel units: 10797 x
++						 * 23999 for the 1080x2400 panel. */
++						int sx = x / 10;
++						int sy = y / 10;
++						printf("SWEET MARBLE TOUCH: pt%d id=%u type=%u x=%d y=%d w=%d -> %d,%d\n",
++						    i, id, type, x, y, w, sx, sy);
++						if (id < 10 && type != 1 && type != 3) {
++							lastx[id] = sx;
++							lasty[id] = sy;
+ 							mask |= 1u << id;
+-							sweet_hid_touch((int)id, 1, x, y);
++							sweet_hid_touch((int)id, 1, sx, sy);
+ 						}
+ 					}
+ 					for (unsigned id = 0; id < 10; ++id) {
+@@ -615,7 +619,7 @@
+ 			sweet_hid_touch((int)id, 0, lastx[id], lasty[id]);
+ 		}
+ 	}
+-	printf("SWEET MARBLE TOUCH: stage-8 done\n");
++	printf("SWEET MARBLE TOUCH: stage-9 done\n");
+ 
+ 
+ 

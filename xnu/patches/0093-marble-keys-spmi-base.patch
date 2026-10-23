@@ -1,0 +1,15 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -17,9 +17,9 @@
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
++#define KEYS_CORE_PA     0x0c400000u
++#define KEYS_OBS_PA      0x0c440000u
++#define KEYS_CNFG_PA     0x0c42d000u
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_RT     0xc110u
+ #define KEYS_NO_APID     0xffffu

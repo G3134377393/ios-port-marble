@@ -1,0 +1,27 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -516,7 +516,7 @@
+ 		lasty[i] = 0;
+ 	}
+ 	printf("SWEET MARBLE TOUCH: polling IRQ gpio21\n");
+-	for (unsigned iter = 0; iter < 24000; ++iter) {
++	for (unsigned iter = 0; ; ++iter) {
+ 		if ((iter % 500) == 0) {
+ 			printf("SWEET MARBLE TOUCH: poll iter=%u irq=%u tda=%#x\n",
+ 			    iter, mt_rd(gpio, GPIO_IO(21)) & 1u, tda);
+@@ -614,12 +614,9 @@
+ 		bb_write(gpio, clk, mosi, miso, tda, z, sizeof(z));
+ 		mt_wait(10);
+ 	}
+-	for (unsigned id = 0; id < 10; ++id) {
+-		if (active & (1u << id)) {
+-			sweet_hid_touch((int)id, 0, lastx[id], lasty[id]);
+-		}
+-	}
+-	printf("SWEET MARBLE TOUCH: stage-9 done\n");
++	/* The event loop is the driver: it must live for the whole boot,
++	 * not stop after a fixed self-test window (24000 x 10 ms = 4 min,
++	 * which is exactly when touch died at the Quick Start screen). */
+ 
+ 
+ 

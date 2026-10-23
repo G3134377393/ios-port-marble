@@ -1,0 +1,100 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -46,6 +46,11 @@
+ #define RH_VRM          4u
+ #define RH_TIMEOUT_US   100000u
+ 
++/* Marble selects its own RSC/TCS and fixed AOP cmd-db at call time. */
++static bool rh_marble;
++static uint32_t rh_rsc_pa = RH_RSC_PA;
++static uint32_t rh_tcs_pa = RH_TCS_PA;
++
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+@@ -100,16 +105,20 @@
+ static int
+ rh_map(void)
+ {
++	if (rh_marble) {
++		rh_rsc_pa = 0x17a20000u;   /* apps_rsc drv-2 */
++		rh_tcs_pa = 0x17a20d00u;   /* drv-2 base + tcs-offset */
++	}
+ 	if (!rh_rsc) {
+-		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
++		rh_rsc = ml_io_map(rh_rsc_pa, 0x100);
+ 	}
+ 	if (!rh_tcs) {
+-		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
++		rh_tcs = ml_io_map(rh_tcs_pa, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict) {
++	if (!rh_marble && !rh_dict) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
++	if (!rh_rsc || !rh_tcs || (!rh_marble && !rh_dict)) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -120,7 +129,7 @@
+ 	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+ 	rh_ncpt = (config >> 27) & 0x1fu;
+ 	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
++	    rh_rsc_pa, rh_tcs_pa, RH_DRV, id, solver, config, count, rh_ncpt);
+ 	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+ 	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+ 	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+@@ -128,10 +137,21 @@
+ 		printf("SWEET RPMH: unsupported RSC geometry/revision\n");
+ 		return ENODEV;
+ 	}
++	if (rh_marble) {
++		/* Marble uses the addresses read from the live cmd-db dump. */
++		return 0;
++	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		uint32_t pa, size;
++		if (rh_marble) {
++			pa = 0x80860000u;   /* aop_cmd_db_region */
++			size = 0x20000u;
++			printf("SWEET RPMH: marble cmd-db pa=%#x size=%#x\n", pa, size);
++		} else {
++			pa = rh_read(rh_dict, 0);
++			size = rh_read(rh_dict, 4);
++			printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		}
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+@@ -328,10 +348,13 @@
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	bool marble = res && (!strcmp(res, "ldoc2") || !strcmp(res, "ldoc9"));
++	if (!res || (!marble && strcmp(res, "ldoc11")) ||
++	    mv < (marble ? 1700u : 2950u) || mv > 3400u) {
++		printf("SWEET RPMH: expected ldoc11 or marble ldoc2/ldoc9\n");
+ 		return EINVAL;
+ 	}
++	rh_marble = marble;
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
+ 	}
+@@ -342,7 +365,9 @@
+ 		goto out;
+ 	}
+ 	error = rh_map();
+-	if (!error) {
++	if (!error && rh_marble) {
++		address = strcmp(res, "ldoc2") == 0 ? 0x42c00u : 0x41400u;
++	} else if (!error) {
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {

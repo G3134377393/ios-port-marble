@@ -1,0 +1,146 @@
+--- a/bsd/dev/marble_touch.c
++++ b/bsd/dev/marble_touch.c
+@@ -24,6 +24,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ void marble_touch_init(void);
+ 
+ #define MARBLE_SE_PA       0x00990000u   /* QUP wrapper 0 SE4, spi@990000 */
+@@ -379,7 +380,11 @@
+ 	mt_wr(se, SE_SPI_TX_LEN, len);
+ 	mt_wr(se, SE_SPI_RX_LEN, len);
+ 	mt_wr(se, SE_M_IRQ_CLEAR, 0xffffffffu);
+-	/* Prefill the TX FIFO: 4 SPI bytes per 32-bit FIFO word. */
++	printf("SWEET MARBLE TOUCH: SPI %s start len=%u status=%#x\n",
++	    tag, len, mt_rd(se, SE_STATUS));
++	mt_wait(500);
++	/* Start the command first; the engine waits while the FIFO is filled. */
++	mt_wr(se, SE_M_CMD0, (3u << 27) | (1u << 2));   /* TX+RX, fragment */
+ 	for (unsigned i = 0; i < len; i += 4) {
+ 		uint32_t word = 0;
+ 		for (unsigned j = 0; j < 4 && i + j < len; ++j) {
+@@ -387,11 +392,8 @@
+ 		}
+ 		mt_wr(se, SE_TX_FIFO, word);
+ 	}
+-	printf("SWEET MARBLE TOUCH: SPI %s start len=%u txcount=%#x rxcount=%#x status=%#x\n",
+-	    tag, len, mt_rd(se, SE_TX_COUNT), mt_rd(se, SE_RX_COUNT),
+-	    mt_rd(se, SE_STATUS));
+-	mt_wait(500);
+-	mt_wr(se, SE_M_CMD0, (3u << 27) | (1u << 2));   /* TX+RX, fragment */
++	printf("SWEET MARBLE TOUCH: SPI %s txfilled=%#x status=%#x\n",
++	    tag, mt_rd(se, SE_TX_COUNT), mt_rd(se, SE_STATUS));
+ 	uint32_t irq = 0;
+ 	bool done = false;
+ 	for (unsigned i = 0; i < 2000; ++i) {
+@@ -424,9 +426,47 @@
+ 		printf(" %02x", rx[i]);
+ 	}
+ 	printf("\n");
+-	mt_wr(se, SE_M_CMD_CTRL, 2);
++	if (!done) {
++		mt_wr(se, SE_M_CMD_CTRL, 2);
++	}
+ 	mt_wr(se, SE_M_IRQ_CLEAR, 0xffffffffu);
+ 	mt_wait(500);
++}
++
++static bool
++mt_goodix_read_bra(vm_offset_t se, uint32_t addr, uint8_t *out,
++    unsigned len, const char *tag)
++{
++	uint8_t tx[41] = {0};
++	uint8_t rx[41] = {0};
++	if (len > 32) {
++		return false;
++	}
++	/* Berlin SPI read: F1 + BE32 address + four 0xff bytes, data at +9. */
++	tx[0] = 0xf1;
++	tx[1] = (uint8_t)(addr >> 24);
++	tx[2] = (uint8_t)(addr >> 16);
++	tx[3] = (uint8_t)(addr >> 8);
++	tx[4] = (uint8_t)addr;
++	tx[5] = tx[6] = tx[7] = tx[8] = 0xff;
++	mt_spi_xfer(se, tx, rx, 9u + len, tag);
++	for (unsigned i = 0; i < len; ++i) {
++		out[i] = rx[9u + i];
++	}
++	return true;
++}
++
++static void
++mt_ic_reset(vm_offset_t gpio)
++{
++	printf("SWEET MARBLE TOUCH: IC reset low in 1s\n");
++	mt_wait(1000);
++	mt_gpio(gpio, 20, 0, 3, 3, true, false);
++	mt_wait(10);
++	mt_gpio(gpio, 20, 0, 3, 3, true, true);
++	mt_wait(100);
++	printf("SWEET MARBLE TOUCH: IC reset done gpio20=%#x gpio21=%#x\n",
++	    mt_rd(gpio, GPIO_IO(20)), mt_rd(gpio, GPIO_IO(21)));
+ }
+ 
+ static void
+@@ -442,7 +482,7 @@
+ 		printf("SWEET MARBLE TOUCH: disabled (marble_touch=0)\n");
+ 		goto out;
+ 	}
+-	printf("SWEET MARBLE TOUCH: stage-3 start in 15s\n");
++	printf("SWEET MARBLE TOUCH: stage-4 start in 15s\n");
+ 	mt_wait(15000);
+ 
+ 	gcc = ml_io_map(MARBLE_GCC_PA, MARBLE_GCC_SIZE);
+@@ -467,9 +507,49 @@
+ 	};
+ 	uint8_t rx[12] = {0};
+ 	mt_spi_xfer(se, tx, rx, sizeof(tx), "test");
++	mt_wait(1000);
+ 
+-	printf("SWEET MARBLE TOUCH: stage-3 done\n");
++	printf("SWEET MARBLE TOUCH: rails in 1s\n");
++	mt_wait(1000);
++	int e2 = sweet_rpmh_vreg_enable("ldoc2", 1800);
++	printf("SWEET MARBLE TOUCH: ldoc2 err=%d\n", e2);
++	mt_wait(3);
++	int e9 = sweet_rpmh_vreg_enable("ldoc9", 3224);
++	printf("SWEET MARBLE TOUCH: ldoc9 err=%d\n", e9);
++	mt_wait(10);
+ 
++	mt_ic_reset(gpio);
++	mt_wait(50);
++
++	uint8_t buf[32] = {0};
++	mt_goodix_read_bra(se, 0x00010000u, buf, 8, "confirm");
++	printf("SWEET MARBLE TOUCH: confirm:");
++	for (unsigned i = 0; i < 8; ++i) {
++		printf(" %02x", buf[i]);
++	}
++	printf("\n");
++	mt_wait(500);
++
++	uint8_t lb[2] = {0};
++	mt_goodix_read_bra(se, 0x00001068u, lb, 2, "verlen");
++	unsigned vle = (unsigned)lb[0] | ((unsigned)lb[1] << 8);
++	unsigned vbe = ((unsigned)lb[0] << 8) | lb[1];
++	unsigned vlen = (vle != 0 && vle <= 64) ? vle : vbe;
++	printf("SWEET MARBLE TOUCH: verlen le=%u be=%u bytes %02x %02x\n",
++	    vle, vbe, lb[0], lb[1]);
++	unsigned n = vlen;
++	if (n == 0 || n > 32) {
++		n = 32;
++	}
++	uint8_t vb[32] = {0};
++	mt_goodix_read_bra(se, 0x00001068u, vb, n, "verinfo");
++	printf("SWEET MARBLE TOUCH: verinfo:");
++	for (unsigned i = 0; i < n; ++i) {
++		printf(" %02x", vb[i]);
++	}
++	printf("\n");
++	printf("SWEET MARBLE TOUCH: stage-4 done\n");
++
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);

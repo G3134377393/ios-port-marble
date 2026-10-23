@@ -1,5 +1,8 @@
 name: xnu
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -153,3 +156,21 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # Public, unauthenticated download path for the RAM-only test workflow.
+      # The artifact is only the kernel binary; the repo and patches are public.
+      - name: Publish kernel to rolling release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f out/kernel.development.sweet ]; then
+            echo "no kernel was built; nothing to publish"
+            exit 0
+          fi
+          gh release view kernel-latest >/dev/null 2>&1 || \
+            gh release create kernel-latest --prerelease \
+              --title "kernel-latest" \
+              --notes "Rolling XNU build for marble (RAM-only fastboot tests)"
+          gh release upload kernel-latest out/kernel.development.sweet --clobber
+          shasum -a 256 out/kernel.development.sweet

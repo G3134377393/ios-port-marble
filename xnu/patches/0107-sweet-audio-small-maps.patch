@@ -1,0 +1,59 @@
+--- a/bsd/dev/sweet_audio.c
++++ b/bsd/dev/sweet_audio.c
+@@ -32,16 +32,20 @@
+ void sweet_audio_probe(void);
+ 
+ #define TLMM_PA         0x0f100000u   /* mainline sm8450.dtsi, not 0x0f000000 */
+-#define TLMM_SIZE       0x00300000u
+ #define GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
+ #define GPIO_IO(n)      (GPIO_CFG(n) + 4u)
+ #define WCD_RST_GPIO    43
++/* Map one 16 KiB page around GPIO43: a 3 MiB TLMM window fails kmem_alloc
++ * (KERN_NO_SPACE) once userland has fragmented the kernel submap. */
++#define GPIO43_PA       (TLMM_PA + GPIO_CFG(WCD_RST_GPIO))
++#define GPIO43_MAP      (GPIO43_PA & ~0x3fffu)
++#define GPIO43_MAP_SIZE 0x4000u
+ 
+ #define NOC_PA          0x03c40000u   /* qcom,waipio-lpass_ag_noc */
+-#define NOC_SIZE        0x00017200u
++#define NOC_SIZE        0x00004000u  /* only the first page is read */
+ 
+ #define LPASS_CC_PA     0x033a0000u   /* mclk mode mux registers */
+-#define LPASS_CC_SIZE   0x00010000u
++#define LPASS_CC_SIZE   0x00008000u  /* covers 0x33a20e0 and 0x33a40d8 */
+ #define RX_MCLK_MUX     0x00040d8u
+ #define WSA_MCLK_MUX    0x00020e0u
+ #define VA_MACRO_MUX_PA 0x03420000u   /* qcom,va_mclk_mode_muxsel */
+@@ -92,7 +96,7 @@
+ static void
+ au_val(const char *name, uint32_t off, uint32_t v)
+ {
+-	printf("SWEET AUDIO: %-18s +%#06x = %#010x\n", name, off, v);
++	printf("SWEET AUDIO: %-18s +0x%06x = 0x%08x\n", name, off, v);
+ 	au_wait(150);
+ }
+ 
+@@ -126,16 +130,16 @@
+ 	}
+ 
+ 	/* Let the gadget, the console thread and userland settle first. */
+-	printf("SWEET AUDIO: ===== probe stage <= %d, start in 20s =====\n", stage);
+-	au_wait(20000);
++	printf("SWEET AUDIO: ===== probe stage <= %d, start in 60s =====\n", stage);
++	au_wait(60000);
+ 
+ 	printf("SWEET AUDIO: --- stage 1: TLMM gpio43 + LPASS AG NoC ---\n");
+-	tlmm = au_map(TLMM_PA, TLMM_SIZE);
++	tlmm = au_map(GPIO43_MAP, GPIO43_MAP_SIZE);
+ 	if (tlmm != 0) {
+-		au_val("tlmm gpio43 cfg", GPIO_CFG(WCD_RST_GPIO),
+-		    au_rd(tlmm, GPIO_CFG(WCD_RST_GPIO)));
+-		au_val("tlmm gpio43 io", GPIO_IO(WCD_RST_GPIO) - GPIO_CFG(WCD_RST_GPIO),
+-		    au_rd(tlmm, GPIO_IO(WCD_RST_GPIO)));
++		au_val("tlmm gpio43 cfg", GPIO43_PA - GPIO43_MAP,
++		    au_rd(tlmm, GPIO43_PA - GPIO43_MAP));
++		au_val("tlmm gpio43 io", GPIO43_PA + 4u - GPIO43_MAP,
++		    au_rd(tlmm, GPIO43_PA + 4u - GPIO43_MAP));
+ 	}
+ 	noc = au_map(NOC_PA, NOC_SIZE);
+ 	if (noc != 0) {

@@ -1,0 +1,128 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -43,8 +43,8 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++#define GCC_SIZE                0x001f4200
++#define GCC_USB30_PRIM_GDSCR    0x49004         /* bit 31: power on (Cape/SM7475) */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+ static const struct {
+@@ -73,11 +73,19 @@
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
+ 	int marble = 0;
++	int marble_pwr = 0;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+@@ -86,6 +94,9 @@
+ 	/* marbleusb=1: skip the sweet GCC clock gate and the QUSB2 PHY block
+ 	 * (marble uses eUSB2 at 0x88e3000; 0x88e2000 is only an EUD register). */
+ 	PE_parse_boot_argn("marbleusb", &marble, sizeof(marble));
++	/* marblepwr=1: bring the USB30 power domain, reset and clocks up before
++	 * probing DWC3 (their initial state is whatever ABL left behind). */
++	PE_parse_boot_argn("marblepwr", &marble_pwr, sizeof(marble_pwr));
+ 	if (!enabled) {
+ 		return;
+ 	}
+@@ -109,7 +120,83 @@
+ 			return;
+ 		}
+ 	} else {
+-		printf("SWEET USB: marble mode, GCC probe skipped\n");
++		/* Marble is Cape/SM7475. Its GCC has the SM8450 (waipio)
++		 * layout: the USB30 GDSC is at 0x49004 (the live DT node
++		 * /soc/qcom,gdsc@149004 is GCC + 0x49004); the USB clock
++		 * branches live in the 0x49000 block and the eUSB2 reference
++		 * gate at 0x9c00c. The sdmmagpie offsets (0xf004, 0xf010, ...)
++		 * are holes on Cape and abort on access. */
++		static const struct {
++			const char *name;
++			uint32_t    off;
++		} marble_clk[] = {
++			{ "master",      0x49018 },
++			{ "sleep",       0x49020 },
++			{ "utmi",        0x49024 },
++			{ "cfg-noc",     0x49084 },
++			{ "aggre",       0x49088 },
++			{ "eusb-clkref", 0x9c00c },
++		};
++		vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++		if (gcc == 0) {
++			printf("SWEET USB: GCC map failed\n");
++			return;
++		}
++		if (marble_pwr) {
++			uint32_t bcr = usb_rd(gcc, 0x49000);   /* USB30_PRIM_BCR */
++			if (bcr & 1u) {
++				usb_wr(gcc, 0x49000, bcr & ~1u);
++				delay(1000);
++				printf("SWEET USB: marble core reset 0x%08x -> 0x%08x\n",
++				    bcr, usb_rd(gcc, 0x49000));
++			}
++			gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++			if (!(gdscr & (1u << 31))) {
++				unsigned n;
++				usb_wr(gcc, GCC_USB30_PRIM_GDSCR, gdscr & ~1u);
++				for (n = 0; n < 100; n++) {
++					delay(1000);
++					gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++					if (gdscr & (1u << 31)) {
++						break;
++					}
++				}
++				printf("SWEET USB: marble GDSC enable -> 0x%08x after %u ms\n", gdscr, n);
++			}
++			for (unsigned i = 0; i < sizeof(marble_clk) / sizeof(marble_clk[0]); i++) {
++				uint32_t v = usb_rd(gcc, marble_clk[i].off);
++				if (v & CBCR_CLK_OFF) {
++					unsigned n;
++					usb_wr(gcc, marble_clk[i].off, v | 1u);
++					for (n = 0; n < 20; n++) {
++						delay(1000);
++						v = usb_rd(gcc, marble_clk[i].off);
++						if (!(v & CBCR_CLK_OFF)) {
++							break;
++						}
++					}
++					printf("SWEET USB: marble clk %-12s enable -> 0x%08x\n",
++					    marble_clk[i].name, v);
++				}
++			}
++		}
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		for (unsigned i = 0; i < sizeof(marble_clk) / sizeof(marble_clk[0]); i++) {
++			cbcr[i] = usb_rd(gcc, marble_clk[i].off);
++			printf("SWEET USB: marble clk %-12s 0x%08x (%s)\n",
++			    marble_clk[i].name, cbcr[i],
++			    (cbcr[i] & CBCR_CLK_OFF) ? "halted" : "on");
++		}
++		printf("SWEET USB: marble GDSC 0x%08x (%s)\n", gdscr,
++		    (gdscr & (1u << 31)) ? "on" : "off");
++		if (!(gdscr & (1u << 31))) {
++			printf("SWEET USB: marble GDSC off; DWC3 not read\n");
++			return;
++		}
++		if (cbcr[3] & CBCR_CLK_OFF) {
++			printf("SWEET USB: marble cfg-noc clock halted; DWC3 not read\n");
++			return;
++		}
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+ 	if (dwc == 0) {

@@ -1,0 +1,19 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1621,9 +1621,14 @@
+ {
+ 	/* The vendor maps the PCM region from 0x2002 and feeds buffers from
+ 	 * the stream port 0x2011; graph commands stay on 0x2010. */
+-	/* Does the ADSP accept a map of its own carveout?  This separates
+-	 * "address outside the DSP's window" from "SHM_MAP is broken". */
++	/* Which physical ranges can the ADSP map at all?  The vendor's
++	 * buffers live around 0x1FFE8000 (inside the 28 MB audio CMA pool);
++	 * probe that, the pool base, and the 4 GB boundary.  Mapping alone
++	 * touches no data. */
+ 	(void)g_apm_map_probe(0x9fd00000u, 0u, 0x4000u, "adsp_carveout");
++	(void)g_apm_map_probe(0x1ffe8000u, 0u, 0x5000u, "vendor_pa");
++	(void)g_apm_map_probe(0x1fe00000u, 0u, 0x4000u, "audio_cma_base");
++	(void)g_apm_map_probe(0x00000000u, 0x1u, 0x4000u, "ddr_4g");
+ 	if (g_apm_shm_map(0x2002u) != 0 || g_shm_va == 0 || g_shm_pa == 0) {
+ 		printf("SWEET GLINK: pcm: no shared memory, tone skipped\n");
+ 		sweet_log_sync();

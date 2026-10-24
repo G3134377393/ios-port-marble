@@ -743,7 +743,7 @@
 +/* SCM calls follow the Linux qcom_scm a6 resume protocol. */
 --- /dev/null
 +++ b/bsd/dev/sweet_glink.c
-@@ -0,0 +1,1072 @@
+@@ -0,0 +1,1157 @@
 +/*
 + * SWEET: minimal GLINK-over-SMEM client for the ADSP GPR router.
 + *
@@ -1455,6 +1455,65 @@
 +	g_send_gpr(pkt, pkt_size);
 +}
 +
++static uint32_t g_le32(const uint8_t *p);
++
++#define PARAM_ID_RSC_AUDIO_HW_CLK 0x0800102Cu
++
++/* Ask PRM for one LPASS clock (q6prm_set_lpass_clock equivalent).
++ * Returns 0 when the ADSP answered with status 0. */
++static int
++g_prm_vote_clock(uint32_t clk_id, uint32_t freq)
++{
++	uint8_t pkt[96];
++	uint32_t pkt_size = 24 + 16 + 36;
++
++	for (uint32_t i = 0; i < sizeof(pkt); i++) {
++		pkt[i] = 0;
++	}
++	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
++	g_put32(pkt + 8, GPR_PRM_SERVICE);
++	g_put32(pkt + 12, GPR_PRM_MODULE);
++	g_put32(pkt + 16, 3);
++	g_put32(pkt + 20, PRM_CMD_REQUEST_HW_RSC);
++	g_put32(pkt + 24 + 0, 0);
++	g_put32(pkt + 24 + 4, 0);
++	g_put32(pkt + 24 + 8, 0);
++	g_put32(pkt + 24 + 12, 36);             /* payload_size */
++	g_put32(pkt + 40 + 0, GPR_PRM_MODULE);
++	g_put32(pkt + 40 + 4, PARAM_ID_RSC_AUDIO_HW_CLK);
++	g_put32(pkt + 40 + 8, 20);              /* param_size */
++	g_put32(pkt + 40 + 12, 0);
++	g_put32(pkt + 56 + 0, 1);               /* num_clk_id */
++	g_put32(pkt + 56 + 4, clk_id);
++	g_put32(pkt + 56 + 8, freq);
++	g_put32(pkt + 56 + 12, 0);              /* clock_attri */
++	g_put32(pkt + 56 + 16, 0);              /* clock_root */
++	printf("SWEET GLINK: PRM clk %#x @ %u Hz\n", clk_id, freq);
++
++	g_rsp_ready = 0;
++	g_rsp_len = 0;
++	g_send_gpr(pkt, pkt_size);
++	for (unsigned i = 0; i < 1500; i += 5) {
++		g_drain(0);
++		if (g_rsp_ready) {
++			break;
++		}
++		g_wait(5);
++	}
++	if (!g_rsp_ready || g_rsp_len < 32) {
++		printf("SWEET GLINK: clk %#x no response\n", clk_id);
++		return -1;
++	}
++	if (g_le32(g_rsp + 28) != 0) {
++		printf("SWEET GLINK: clk %#x status %#x\n", clk_id,
++		    g_le32(g_rsp + 28));
++		return -1;
++	}
++	printf("SWEET GLINK: clk %#x ok\n", clk_id);
++	return 0;
++}
++
 +/* APM_CMD_GET_SPF_STATE on the spf_core service: proves APM is alive even
 + * if the PRM vote is refused.  src_port and dest_port are both 1. */
 +static void
@@ -1672,21 +1731,31 @@
 +}
 +
 +static void
-+g_lpass_probe(void)
++g_lpass_probe(int clk_va_ok, int clk_rx_ok)
 +{
-+	int probe = 0;
++	int both = 0, do_rx = 0, do_va = 0;
 +
-+	(void)PE_parse_boot_argn("sweetglinkread", &probe, sizeof(probe));
-+	if (!probe) {
++	(void)PE_parse_boot_argn("sweetglinkread", &both, sizeof(both));
++	(void)PE_parse_boot_argn("sweetreadrx", &do_rx, sizeof(do_rx));
++	(void)PE_parse_boot_argn("sweetreadva", &do_va, sizeof(do_va));
++	if (both) {
++		do_rx = 1;
++		do_va = 1;
++	}
++	if (!do_rx && !do_va) {
 +		printf("SWEET GLINK: lpass read skipped (sweetglinkread=1)\n");
 +		return;
 +	}
-+	{
++	if (do_rx && clk_rx_ok) {
 +		vm_offset_t win = g_win_alloc(0x8000);
 +
 +		if (win != 0) {
-+			vm_offset_t rx = g_win_map(win, G_LPASS_RX_PA, 16);
++			vm_offset_t rx;
 +
++			printf("SWEET GLINK: reading rx_macro %#x\n",
++			    G_LPASS_RX_PA);
++			g_wait(2000);   /* let the log ring reach the disk */
++			rx = g_win_map(win, G_LPASS_RX_PA, 16);
 +			printf("SWEET GLINK: rx_macro %08x %08x %08x %08x\n",
 +			    *(volatile uint32_t *)(rx + 0x0),
 +			    *(volatile uint32_t *)(rx + 0x4),
@@ -1694,13 +1763,19 @@
 +			    *(volatile uint32_t *)(rx + 0xc));
 +			g_win_free(win, 0x8000);
 +		}
++	} else if (do_rx) {
++		printf("SWEET GLINK: rx read skipped (clock vote)\n");
 +	}
-+	{
++	if (do_va && clk_va_ok) {
 +		vm_offset_t win = g_win_alloc(0x8000);
 +
 +		if (win != 0) {
-+			vm_offset_t va = g_win_map(win, G_LPASS_VA_PA, 16);
++			vm_offset_t va;
 +
++			printf("SWEET GLINK: reading va_macro %#x\n",
++			    G_LPASS_VA_PA);
++			g_wait(2000);   /* let the log ring reach the disk */
++			va = g_win_map(win, G_LPASS_VA_PA, 16);
 +			printf("SWEET GLINK: va_macro %08x %08x %08x %08x\n",
 +			    *(volatile uint32_t *)(va + 0x0),
 +			    *(volatile uint32_t *)(va + 0x4),
@@ -1708,6 +1783,8 @@
 +			    *(volatile uint32_t *)(va + 0xc));
 +			g_win_free(win, 0x8000);
 +		}
++	} else if (do_va) {
++		printf("SWEET GLINK: va read skipped (clock vote)\n");
 +	}
 +}
 +
@@ -1810,7 +1887,15 @@
 +	}
 +	g_drain(100);
 +
-+	g_lpass_probe();
++	/* Clocks the AP needs before it may read inside those macros. */
++	{
++		int va_clk = g_prm_vote_clock(0x307, 19200000);  /* VA_CORE_MCLK */
++		int rx_clk = g_prm_vote_clock(0x30e, 19200000);  /* RX_CORE_MCLK */
++
++		g_drain(100);
++		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);
++		g_lpass_probe(va_clk == 0, rx_clk == 0);
++	}
 +
 +out:
 +	printf("SWEET GLINK: ===== done =====\n");

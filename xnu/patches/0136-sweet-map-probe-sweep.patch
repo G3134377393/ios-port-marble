@@ -1,0 +1,124 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1308,26 +1308,41 @@
+ 		return 0;
+ 	}
+ 	if (!g_shm_va) {
+-		/* The ADSP would not map a 64 KB buffer that landed above
+-		 * 0x8_00000000; the vendor's regions sit around 5 GB.  Ask for
+-		 * a page number below 8 GB, and fall back if that fails. */
+-		if (kmem_alloc_contig(kernel_map, &g_shm_va, G_SHM_SIZE,
+-		    PAGE_MASK, 0x200000u, 0,
+-		    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+-		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS &&
+-		    kmem_alloc_contig(kernel_map, &g_shm_va, G_SHM_SIZE,
+-		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+-		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			g_shm_va = 0;
+-			printf("SWEET GLINK: shm: no contiguous memory\n");
+-			return -1;
++		/* Find the lowest physical range the kernel can still give us:
++		 * the ADSP's mapping window is far below the 35 GB the
++		 * unconstrained allocator hands out. */
++		static const ppnum_t lim[] = {
++			0x40000u, 0x80000u, 0x100000u, 0x180000u,
++			0x200000u, 0x300000u, 0u
++		};
++
++		for (unsigned i = 0; i < sizeof(lim) / sizeof(lim[0]); i++) {
++			vm_offset_t va = 0;
++
++			if (kmem_alloc_contig(kernel_map, &va, G_SHM_SIZE,
++			    PAGE_MASK, lim[i], 0,
++			    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++			    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++				printf("SWEET GLINK: shm: limit=%#x failed\n", lim[i]);
++				sweet_log_sync();
++				continue;
++			}
++			pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++			if (!pn) {
++				kmem_free(kernel_map, va, G_SHM_SIZE);
++				continue;
++			}
++			g_shm_va = va;
++			g_shm_pa = ptoa_64(pn);
++			printf("SWEET GLINK: shm: limit=%#x pa=%#llx\n",
++			    lim[i], g_shm_pa);
++			sweet_log_sync();
++			break;
+ 		}
+-		pn = pmap_find_phys(kernel_pmap, (addr64_t)g_shm_va);
+-		if (!pn) {
+-			printf("SWEET GLINK: shm: no physical page\n");
++		if (!g_shm_va) {
++			printf("SWEET GLINK: shm: no contiguous memory\n");
+ 			return -1;
+ 		}
+-		g_shm_pa = ptoa_64(pn);
+ 	}
+ 	memset(pkt, 0, sizeof(pkt));
+ 	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
+@@ -1377,6 +1392,52 @@
+ 	return 0;
+ }
+ 
++/* One-shot SHM_MAP probe for an arbitrary physical address.  Used to find
++ * out which addresses the ADSP is willing to map. */
++static int
++g_apm_map_probe(uint32_t pa_lsw, uint32_t pa_msw, uint32_t size,
++    const char *what)
++{
++	uint8_t pkt[24 + 20];
++	uint32_t pkt_size = sizeof(pkt);
++
++	memset(pkt, 0, sizeof(pkt));
++	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8) | 0x10000u);
++	g_put32(pkt + 8, 0x2002u);
++	g_put32(pkt + 12, 1);
++	g_put32(pkt + 16, 0x2100u);
++	g_put32(pkt + 20, APM_CMD_SHARED_MEM_MAP_REGIONS);
++	g_put32(pkt + 24, APM_SHM_POOL | (1u << 16));
++	g_put32(pkt + 28, 4u);
++	g_put32(pkt + 32, pa_lsw);
++	g_put32(pkt + 36, pa_msw);
++	g_put32(pkt + 40, size);
++	printf("SWEET GLINK: map_probe %s pa=%#x:%#x size=%#x\n",
++	    what, pa_msw, pa_lsw, size);
++	sweet_log_sync();
++	g_rsp_ready = 0;
++	g_rsp_len = 0;
++	g_send_gpr(pkt, pkt_size);
++	for (unsigned i = 0; i < 2000; i += 5) {
++		g_drain(0);
++		if (g_rsp_ready) {
++			break;
++		}
++		g_wait(5);
++	}
++	if (!g_rsp_ready || g_rsp_len < 32) {
++		printf("SWEET GLINK: map_probe %s: no rsp\n", what);
++		sweet_log_sync();
++		return -1;
++	}
++	printf("SWEET GLINK: map_probe %s rsp len=%u w24=%#x w28=%#x "
++	    "w32=%#x\n", what, g_rsp_len, g_le32(g_rsp + 24),
++	    g_le32(g_rsp + 28), g_le32(g_rsp + 32));
++	sweet_log_sync();
++	return g_le32(g_rsp + 28) == 0 ? 0 : -1;
++}
++
+ /* GRAPH_OPEN with the payload in the mapped region, as the vendor does. */
+ static int
+ g_apm_graph_open_shm(uint32_t src_port, const uint8_t *payload, uint32_t len,
+@@ -1560,6 +1621,9 @@
+ {
+ 	/* The vendor maps the PCM region from 0x2002 and feeds buffers from
+ 	 * the stream port 0x2011; graph commands stay on 0x2010. */
++	/* Does the ADSP accept a map of its own carveout?  This separates
++	 * "address outside the DSP's window" from "SHM_MAP is broken". */
++	(void)g_apm_map_probe(0x9fd00000u, 0u, 0x4000u, "adsp_carveout");
+ 	if (g_apm_shm_map(0x2002u) != 0 || g_shm_va == 0 || g_shm_pa == 0) {
+ 		printf("SWEET GLINK: pcm: no shared memory, tone skipped\n");
+ 		sweet_log_sync();

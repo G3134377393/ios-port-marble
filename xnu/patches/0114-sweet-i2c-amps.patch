@@ -15,7 +15,7 @@
  
  /* GLINK commands */
  #define CMD_VERSION             0
-@@ -1342,6 +1343,7 @@
+@@ -1347,6 +1348,7 @@
  		g_drain(100);
  		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);
  		g_apm_graph_bringup();

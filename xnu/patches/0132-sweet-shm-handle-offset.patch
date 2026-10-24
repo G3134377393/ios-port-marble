@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1351,10 +1351,14 @@
+ 		printf("SWEET GLINK: shm_map: no response (%u)\n", g_rsp_len);
+ 		return -1;
+ 	}
+-	g_shm_handle = g_le32(g_rsp + 24);
+-	printf("SWEET GLINK: shm_map rsp op=%#x handle=%#x\n",
+-	    g_le32(g_rsp + 20), g_shm_handle);
+-	if (g_shm_handle == 0 || g_shm_handle == 0xffffffffu) {
++	/* The response payload is {echoed opcode, mem_map_handle}: the
++	 * handle is the word after the opcode, not the opcode itself. */
++	g_shm_handle = g_le32(g_rsp + 28);
++	printf("SWEET GLINK: shm_map rsp w24=%#x handle=%#x w32=%#x\n",
++	    g_le32(g_rsp + 24), g_shm_handle, g_le32(g_rsp + 32));
++	if (g_shm_handle == 0 || g_shm_handle == 0xffffffffu ||
++	    g_le32(g_rsp + 24) != APM_CMD_SHARED_MEM_MAP_REGIONS) {
++		printf("SWEET GLINK: shm_map: unexpected response\n");
+ 		return -1;
+ 	}
+ 	g_shm_mapped = 1;

@@ -229,7 +229,7 @@
  void
  sweet_glink_probe(void)
  {
-@@ -1184,9 +1346,11 @@
+@@ -1184,10 +1346,34 @@
  
  		g_drain(100);
  		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);
@@ -240,4 +240,27 @@
 +
  out:
  	printf("SWEET GLINK: ===== done =====\n");
++	{
++		int rb = 0;
++
++		(void)PE_parse_boot_argn("sweetreboot", &rb, sizeof(rb));
++		if (rb) {
++			/* Boot arg sweetreboot=1: reset the SoC so the next
++			 * ring pull does not need a human with a power
++			 * button.  smc #0 is already used by the SCM path. */
++			printf("SWEET GLINK: PSCI SYSTEM_RESET\n");
++			sweet_log_sync();
++			{
++				register uint64_t x0 __asm("x0") = 0x84000009ull;
++
++				__asm volatile("dsb sy" ::: "memory");
++				__asm volatile("smc #0" : "+r"(x0) ::
++				    "x1", "x2", "x3", "memory");
++			}
++			for (;;) {
++				delay(1000);
++			}
++		}
++	}
  }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

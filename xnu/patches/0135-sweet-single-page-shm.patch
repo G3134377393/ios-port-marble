@@ -1,0 +1,33 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1231,7 +1231,7 @@
+ #define G_CDMA_MODULE_OFF                   224u
+ #define APM_VENDOR_SG_ID                    0xb00000d5u
+ #define APM_SHM_POOL                        3u   /* SHMEM8_4K */
+-#define G_SHM_SIZE                          0x5000u
++#define G_SHM_SIZE                          0x1000u
+ 
+ /* Send one APM command with the payload inlined in the GPR packet. */
+ static int
+@@ -1344,8 +1344,8 @@
+ 	g_put32(pkt + 32, (uint32_t)g_shm_pa);
+ 	g_put32(pkt + 36, (uint32_t)(g_shm_pa >> 32));
+ 	g_put32(pkt + 40, G_SHM_SIZE);
+-	printf("SWEET GLINK: shm_map src=%#x pa=%#llx size=%#x\n",
+-	    src_port, g_shm_pa, G_SHM_SIZE);
++	printf("SWEET GLINK: shm_map src=%#x pa=%#llx size=%#x "
++	    "valid=1\n", src_port, g_shm_pa, G_SHM_SIZE);
+ 	sweet_log_sync();
+ 	g_rsp_ready = 0;
+ 	g_rsp_len = 0;
+@@ -1462,8 +1462,8 @@
+  */
+ #define APM_CMD_DATA_BUFFER_V2      0x0400100Au
+ #define APM_RSP_DATA_BUFFER_DONE_V2 0x05001004u
+-#define G_PCM_OFF_A                 0x4000u
+-#define G_PCM_OFF_B                 0x4800u
++#define G_PCM_OFF_A                 0x0000u
++#define G_PCM_OFF_B                 0x0800u
+ #define G_PCM_BYTES                 1152u
+ 
+ static const int16_t g_sine_48[48] = {

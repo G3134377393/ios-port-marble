@@ -1,6 +1,16 @@
 --- a/bsd/dev/sweet_glink.c
 +++ b/bsd/dev/sweet_glink.c
-@@ -294,15 +294,18 @@
+@@ -117,7 +117,8 @@
+ 	uint8_t  buf[G_INTENT_SIZE];
+ };
+ 
+-static struct g_riid g_riids[G_NINTENTS];
++#define G_NRIIDS 256           /* the ADSP advertises ~120 of them */
++static struct g_riid g_riids[G_NRIIDS];
+ static int           g_nriids;
+ static struct g_liid g_liids[G_NINTENTS];
+ static int           g_nliids;
+@@ -294,15 +295,18 @@
  	g_kick();
  }
  
@@ -23,7 +33,39 @@
  	}
  	msg[0] = CMD_TX_DATA;
  	msg[1] = 0;
-@@ -650,8 +653,8 @@
+@@ -483,11 +487,26 @@
+ 
+ 			printf("SWEET GLINK: remote intent id=%u size=%u\n",
+ 			    id, size);
+-			if (g_nriids < G_NINTENTS) {
+-				g_riids[g_nriids].id = id;
+-				g_riids[g_nriids].size = size;
+-				g_riids[g_nriids].in_use = 0;
+-				g_nriids++;
++			{
++				int found = 0;
++
++				/* A re-advertised id means the remote finished
++				 * with it: reset it instead of filling the
++				 * table with duplicates. */
++				for (int k = 0; k < g_nriids; k++) {
++					if (g_riids[k].id == id) {
++						g_riids[k].size = size;
++						g_riids[k].in_use = 0;
++						found = 1;
++						break;
++					}
++				}
++				if (!found && g_nriids < G_NRIIDS) {
++					g_riids[g_nriids].id = id;
++					g_riids[g_nriids].size = size;
++					g_riids[g_nriids].in_use = 0;
++					g_nriids++;
++				}
+ 			}
+ 		}
+ 		g_rx_advance((8 + count * 8 + 7u) & ~7u);
+@@ -650,8 +669,8 @@
  {
  	struct g_riid *r;
  
@@ -34,7 +76,7 @@
  	}
  	if (g_pick_riid(len) == NULL) {
  		printf("SWEET GLINK: requesting %u-byte intent\n", len);
-@@ -1072,6 +1075,144 @@
+@@ -1072,6 +1091,144 @@
  	}
  }
  
@@ -179,7 +221,7 @@
  void
  sweet_glink_probe(void)
  {
-@@ -1184,9 +1325,11 @@
+@@ -1184,9 +1341,11 @@
  
  		g_drain(100);
  		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);

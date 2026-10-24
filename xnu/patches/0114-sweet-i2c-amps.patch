@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -116,3 +116,4 @@
+@@ -114,4 +114,5 @@
  bsd/dev/sweet_adsp.c			standard
  bsd/dev/sweet_glink.c			standard
 +bsd/dev/sweet_i2c.c			standard
@@ -15,7 +15,7 @@
  
  /* GLINK commands */
  #define CMD_VERSION             0
-@@ -1326,6 +1327,7 @@
+@@ -1342,6 +1343,7 @@
  		g_drain(100);
  		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);
  		g_apm_graph_bringup();

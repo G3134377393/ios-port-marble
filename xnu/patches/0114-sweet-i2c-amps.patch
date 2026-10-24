@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -114,4 +114,5 @@
+@@ -116,3 +116,4 @@
  bsd/dev/sweet_adsp.c			standard
  bsd/dev/sweet_glink.c			standard
 +bsd/dev/sweet_i2c.c			standard

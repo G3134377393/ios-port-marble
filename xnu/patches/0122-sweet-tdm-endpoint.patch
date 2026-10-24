@@ -1,0 +1,188 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1158,6 +1158,8 @@
+ #define APM_GRAPH_SG_ID                     0xb000013du
+ #define G_SAL_IID                           0x483fu
+ #define G_CDMA_IID                          0x4840u
++#define G_TDM_MODULE_ID                     0x0700100eu
++#define G_CDMA_MODULE_OFF                   224u
+ #define APM_VENDOR_SG_ID                    0xb00000d5u
+ #define APM_SHM_POOL                        3u   /* SHMEM8_4K */
+ #define G_SHM_SIZE                          0x10000u
+@@ -1534,6 +1536,72 @@
+ 	v = 0;
+ 	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001176, &v, 4,
+ 	    "cdma/power_mode");
++}
++
++/*
++ * The speaker path does not go through the WCD codec's CODEC_DMA: the two
++ * AW882xx amplifiers hang off the LPASS TDM/I2S lines.  The vendor's capture
++ * graph proves the endpoint family and its configuration (TDM interface 2,
++ * 4 slots of 32 bit, slots 0/1 active, internal sync, 96 kHz / 32 bit).
++ * Build the same endpoint as a playback sink (MODULE_ID_TDM_SINK 0x0700100e,
++ * input port 2) and let SAL convert our 48 kHz / 16 bit buffers.
++ */
++static void
++g_audio_graph_cfg_tdm(uint32_t src_port)
++{
++	/* PARAM_ID_TDM_INTF_CFG, captured verbatim from the vendor endpoint:
++	 * lpaif 0, intf 2, sync internal, data-out enabled, slot mask 3,
++	 * 4 slots/frame, 32-bit slots, short-sync bit mode, 1 BCLK delay. */
++	static const uint8_t tdm_intf[28] = {
++		0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++		0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00,
++		0x04, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x01, 0x00, 0x00, 0x00,
++	};
++	uint8_t mf[12], sal_mf[32];
++	uint32_t v;
++
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x0800101b, tdm_intf,
++	    sizeof(tdm_intf), "tdm/intf");
++
++	/* PARAM_ID_HW_EP_MF_CFG: 96 kHz, 32 bit, 2 channels, fixed point. */
++	g_put32(mf + 0, 96000);
++	g_put32(mf + 4, 32u | (2u << 16));
++	g_put32(mf + 8, 1);
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001017, mf, 12,
++	    "tdm/mf");
++
++	v = 1;
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001018, &v, 4,
++	    "tdm/frame_size");
++	v = 0;
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001176, &v, 4,
++	    "tdm/power_mode");
++
++	/* PARAM_ID_MEDIA_FORMAT for SAL: the AP buffers are 48 kHz / 16 bit /
++	 * stereo PCM (payload_media_fmt_pcm_t follows the 12-byte header). */
++	g_put32(sal_mf + 0, 1);                 /* fixed point */
++	g_put32(sal_mf + 4, 0x09001000);        /* MEDIA_FMT_ID_PCM */
++	g_put32(sal_mf + 8, 18);                /* PCM payload size */
++	g_put32(sal_mf + 12, 48000);
++	sal_mf[16] = 16; sal_mf[17] = 0;        /* bit_width */
++	sal_mf[18] = 1;                         /* alignment */
++	sal_mf[19] = 1;                         /* interleaved */
++	sal_mf[20] = 16; sal_mf[21] = 0;        /* bits_per_sample */
++	sal_mf[22] = 15; sal_mf[23] = 0;        /* q_factor */
++	sal_mf[24] = 1;  sal_mf[25] = 0;        /* endianness */
++	sal_mf[26] = 2;  sal_mf[27] = 0;        /* channels */
++	sal_mf[28] = 1;  sal_mf[29] = 2;        /* L, R */
++	sal_mf[30] = 0;  sal_mf[31] = 0;
++	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800100c, sal_mf,
++	    sizeof(sal_mf), "sal/media_format");
++
++	v = 32;                                 /* SAL output: 32 bit */
++	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x08001016, &v, 4,
++	    "sal/output_cfg");
++	v = 1;
++	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800101e, &v, 4,
++	    "sal/limiter");
+ }
+ 
+ /* PREPARE / START / STOP take a SUB_GRAPH_LIST {count, id}. */
+@@ -1572,7 +1640,29 @@
+ {
+ 	/* The vendor's AGM clients send from 0x2010/0x2011. */
+ 	const uint32_t port = 0x2010u;
++	uint8_t tdm_payload[sizeof(g_graph_open_payload)];
+ 
++	/*
++	 * The speakers are on the TDM lines, so the endpoint must be
++	 * MODULE_ID_TDM_SINK, not CODEC_DMA_SINK.  The graph is otherwise the
++	 * same SAL -> endpoint pair; only the module ID at a fixed offset in
++	 * the serialised graph changes.
++	 */
++	memcpy(tdm_payload, g_graph_open_payload, sizeof(tdm_payload));
++	g_put32(tdm_payload + G_CDMA_MODULE_OFF, G_TDM_MODULE_ID);
++	if (g_apm_cmd(port, 1, tdm_payload, sizeof(tdm_payload),
++	    APM_CMD_GRAPH_OPEN, "graph_open/tdm-inline") == 0) {
++		g_audio_graph_cfg_tdm(port);
++		if (g_apm_graph_start(port, APM_GRAPH_SG_ID) == 0) {
++			if (g_apm_shm_map(0x2002u) == 0) {
++				g_audio_tone(port, G_SAL_IID);
++			} else {
++				printf("SWEET GLINK: no shared memory for PCM\n");
++			}
++		}
++		return;
++	}
++
+ 	/* Inline (mainline style) keeps working as the control case. */
+ 	if (g_apm_cmd(port, 1, g_graph_open_payload,
+ 	    sizeof(g_graph_open_payload), APM_CMD_GRAPH_OPEN,
+--- a/bsd/dev/sweet_i2c.c
++++ b/bsd/dev/sweet_i2c.c
+@@ -61,6 +61,19 @@
+ 	}
+ }
+ 
++/* Read a pin without changing its configuration: bit 0 of GPIO_IO is the
++ * level actually present on the pad, bit 1 is the value we drive. */
++static int
++sw_gpio_read_level(uint32_t pa)
++{
++	vm_offset_t v = ml_io_map(pa, 0x1000);
++
++	if (!v) {
++		return -1;
++	}
++	return (int)(*(volatile uint32_t *)(v + 4) & 1u);
++}
++
+ /* Probe every 7-bit address once.  Reading register 0 is harmless even on
+  * devices that do not implement it: an address is counted only if the
+  * address byte itself was acknowledged. */
+@@ -339,6 +352,25 @@
+ 	cfg_sda = sw_rd(SW_GPIO_CFG(SW_I2C_SDA));
+ 	printf("SWEET I2C: TLMM @%#x scl cfg=%#x sda cfg=%#x\n",
+ 	    SW_I2C_TLMM_PA, cfg_scl, cfg_sda);
++
++	/* Leave the bus alone and look at what the bootloader handed us.  The
++	 * external I2C pull-ups are a good proxy for the audio I/O rail: if
++	 * they are unpowered the lines sit low even with both pins released. */
++	printf("SWEET I2C: levels before (rstA=%d spksw=%d scl=%d sda=%d "
++	    "rstB=%d irqA=%d irqB=%d)\n",
++	    sw_gpio_read_level(SW_AMP_RST_A_PA),
++	    sw_gpio_read_level(SW_AMP_SPKSW_PA),
++	    (int)(sw_rd(SW_GPIO_IO(SW_I2C_SCL)) & 1u),
++	    (int)(sw_rd(SW_GPIO_IO(SW_I2C_SDA)) & 1u),
++	    sw_gpio_read_level(SW_AMP_RST_B_PA),
++	    sw_gpio_read_level(0x0f158000u),    /* GPIO88, amp A irq */
++	    sw_gpio_read_level(0x0f13f000u));   /* GPIO63, amp B irq */
++	sw_gpio_cfg(SW_I2C_SCL, 0, false);
++	sw_gpio_cfg(SW_I2C_SDA, 0, false);
++	delay(200);
++	printf("SWEET I2C: floating (no pull) scl=%d sda=%d\n",
++	    (int)(sw_rd(SW_GPIO_IO(SW_I2C_SCL)) & 1u),
++	    (int)(sw_rd(SW_GPIO_IO(SW_I2C_SDA)) & 1u));
+ 
+ 	int found;
+ 
+@@ -367,16 +399,20 @@
+ 		    (int)(sw_rd(SW_GPIO_IO(SW_I2C_SDA)) & 1u));
+ 	}
+ 
+-	/* The speaker switch may gate the amplifiers' supply. */
+-	sw_gpio_drive(SW_AMP_SPKSW_PA, true);
+-	delay(5);
+-	printf("SWEET I2C: spksw high\n");
+-
+ 	sw_i2c_pins_up();
+ 	printf("SWEET I2C: bus idle, sda=%d\n", sw_sda_read());
+ 	found = sw_i2c_scan("released");
+ 
+ 	if (found == 0) {
++		/* Android's amp driver leaves spksw low when it reads the chip
++		 * ID; earlier runs drove it high before scanning.  Try both. */
++		sw_gpio_drive(SW_AMP_SPKSW_PA, true);
++		delay(5);
++		printf("SWEET I2C: spksw high\n");
++		found = sw_i2c_scan("spksw-high");
++	}
++
++	if (found == 0) {
+ 		/* Diagnostic: with reset asserted, nothing should answer. */
+ 		sw_i2c_pins_down();
+ 		sw_gpio_drive(SW_AMP_RST_A_PA, false);

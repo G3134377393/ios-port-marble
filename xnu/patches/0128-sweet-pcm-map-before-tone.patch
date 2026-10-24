@@ -1,0 +1,45 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1279,6 +1279,7 @@
+ 
+ 		printf("SWEET GLINK: %s rsp op=%#x status=%#x\n", what,
+ 		    g_le32(g_rsp + 24), status);
++		sweet_log_sync();
+ 		return status == 0 ? 0 : -1;
+ 	}
+ 	printf("SWEET GLINK: %s rsp %u bytes\n", what, g_rsp_len);
+@@ -1407,6 +1408,7 @@
+ 
+ 		printf("SWEET GLINK: %s rsp op=%#x status=%#x\n", what,
+ 		    g_le32(g_rsp + 24), status);
++		sweet_log_sync();
+ 		return status == 0 ? 0 : -1;
+ 	}
+ 	printf("SWEET GLINK: %s rsp %u bytes\n", what, g_rsp_len);
+@@ -1513,6 +1515,13 @@
+ static void
+ g_audio_tone(uint32_t src_port, uint32_t dst_port)
+ {
++	/* The PCM buffers live inside the mapped region; map it from the
++	 * same client port before the first write. */
++	if (g_apm_shm_map(src_port) != 0 || g_shm_va == 0 || g_shm_pa == 0) {
++		printf("SWEET GLINK: pcm: no shared memory, tone skipped\n");
++		sweet_log_sync();
++		return;
++	}
+ 	g_fill_tone(G_PCM_OFF_A);
+ 	g_fill_tone(G_PCM_OFF_B);
+ 	flush_dcache64((addr64_t)(g_shm_pa + G_PCM_OFF_A), 0x1000, 1);
+@@ -1812,9 +1821,12 @@
+ 	    APM_CMD_GRAPH_OPEN, "graph_open/vp-inline") == 0) {
+ 		g_audio_graph_cfg_vp(port);
+ 		if (g_apm_graph_start(port, APM_VP_SG_ID) == 0) {
++			printf("SWEET GLINK: vendor graph started\n");
++			sweet_log_sync();
+ 			g_audio_tone(port, G_VP_SAL_IID);
+ 		} else {
+ 			printf("SWEET GLINK: vendor graph opened but did not start\n");
++			sweet_log_sync();
+ 		}
+ 		return;
+ 	}

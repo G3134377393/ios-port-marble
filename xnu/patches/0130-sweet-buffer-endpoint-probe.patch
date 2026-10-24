@@ -1,0 +1,73 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1503,13 +1503,38 @@
+ 		}
+ 		g_wait(5);
+ 	}
++	static int dbg;
+ 	if (!g_rsp_ready || g_rsp_len < 40) {
++		if (dbg++ < 4) {
++			printf("SWEET GLINK: data_buffer: no rsp (dst=%#x)\n",
++			    dst_port);
++			sweet_log_sync();
++		}
+ 		return -1;
+ 	}
+-	if (g_le32(g_rsp + 20) != APM_RSP_DATA_BUFFER_DONE_V2) {
+-		return -1;
++	{
++		uint32_t rop = g_le32(g_rsp + 20);
++		uint32_t w24 = g_le32(g_rsp + 24);
++		uint32_t w28 = g_le32(g_rsp + 28);
++		uint32_t w32 = g_le32(g_rsp + 32);
++		uint32_t w36 = g_le32(g_rsp + 36);
++
++		if (rop != APM_RSP_DATA_BUFFER_DONE_V2) {
++			if (dbg++ < 4) {
++				printf("SWEET GLINK: data_buffer: dst=%#x rsp "
++				    "op=%#x w24=%#x w28=%#x w32=%#x w36=%#x\n",
++				    dst_port, rop, w24, w28, w32, w36);
++				sweet_log_sync();
++			}
++			return -1;
++		}
++		if (w36 != 0 && dbg++ < 4) {
++			printf("SWEET GLINK: data_buffer: dst=%#x done status=%#x "
++			    "w28=%#x w32=%#x\n", dst_port, w36, w28, w32);
++			sweet_log_sync();
++		}
++		return w36 == 0 ? 0 : -1;
+ 	}
+-	return g_le32(g_rsp + 36) == 0 ? 0 : -1;
+ }
+ 
+ static void
+@@ -1525,6 +1550,28 @@
+ 	g_fill_tone(G_PCM_OFF_A);
+ 	g_fill_tone(G_PCM_OFF_B);
+ 	flush_dcache64((addr64_t)(g_shm_pa + G_PCM_OFF_A), 0x1000, 1);
++
++	/* The vendor graph buffers are taken by whichever module owns the
++	 * stream input.  Find it empirically: send one frame to each of the
++	 * likely instances and keep the first one that answers with DONE. */
++	if (dst_port == G_VP_SAL_IID) {
++		static const uint32_t cand[4] = {
++			G_VP_SAL_IID, 0x48bau, 0x4007u, 0x418eu
++		};
++
++		for (int i = 0; i < 4; i++) {
++			int r = g_apm_data_buffer(src_port, cand[i],
++			    G_PCM_OFF_A, G_PCM_BYTES, 0x40u + (uint32_t)i);
++
++			printf("SWEET GLINK: buffer probe dst=%#x -> %d\n",
++			    cand[i], r);
++			sweet_log_sync();
++			if (r == 0) {
++				dst_port = cand[i];
++				break;
++			}
++		}
++	}
+ 	printf("SWEET GLINK: pcm tone start (dst=%#x)\n", dst_port);
+ 
+ 	for (int n = 0; n < 2000; n++) {

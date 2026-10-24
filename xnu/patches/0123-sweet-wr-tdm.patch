@@ -1,0 +1,144 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1158,7 +1158,9 @@
+ #define APM_GRAPH_SG_ID                     0xb000013du
+ #define G_SAL_IID                           0x483fu
+ #define G_CDMA_IID                          0x4840u
++#define G_WR_MODULE_ID                      0x07001000u
+ #define G_TDM_MODULE_ID                     0x0700100eu
++#define G_INPUT_MODULE_OFF                  216u
+ #define G_CDMA_MODULE_OFF                   224u
+ #define APM_VENDOR_SG_ID                    0xb00000d5u
+ #define APM_SHM_POOL                        3u   /* SHMEM8_4K */
+@@ -1391,10 +1393,13 @@
+ static void
+ g_fill_tone(uint32_t off)
+ {
+-	int16_t *p = (int16_t *)(g_shm_va + off);
++	int32_t *p = (int32_t *)(g_shm_va + off);
+ 
+-	for (uint32_t i = 0; i < G_PCM_BYTES / 4; i++) {
+-		int16_t v = g_sine_48[i % 48];
++	/* 1152 bytes = 144 frames of 32-bit stereo.  The 48-entry table is
++	 * one period, so at 96 kHz this is a 2 kHz tone with exactly three
++	 * periods per buffer. */
++	for (uint32_t i = 0; i < G_PCM_BYTES / 8; i++) {
++		int32_t v = (int32_t)g_sine_48[i % 48] << 16;
+ 
+ 		p[2 * i] = v;
+ 		p[2 * i + 1] = v;
+@@ -1446,7 +1451,7 @@
+ 	flush_dcache64((addr64_t)(g_shm_pa + G_PCM_OFF_A), 0x1000, 1);
+ 	printf("SWEET GLINK: pcm tone start (dst=%#x)\n", dst_port);
+ 
+-	for (int n = 0; n < 500; n++) {
++	for (int n = 0; n < 2000; n++) {
+ 		uint32_t off = (n & 1) ? G_PCM_OFF_B : G_PCM_OFF_A;
+ 
+ 		if (g_apm_data_buffer(src_port, dst_port, off, G_PCM_BYTES,
+@@ -1455,14 +1460,13 @@
+ 			return;
+ 		}
+ 	}
+-	printf("SWEET GLINK: pcm tone done (500 buffers)\n");
++	printf("SWEET GLINK: pcm tone done (2000 buffers)\n");
+ }
+ 
+ /*
+- * Media format for the two modules of the simple playback graph.  The vendor
+- * runs its hardware endpoint at 96 kHz / 32 bit and puts an MFC in front of
+- * it; this graph has no MFC, so both ends carry the same 48 kHz / 16 bit /
+- * stereo PCM that we feed from the AP.
++ * The AGM table's simple graph feeds a CODEC_DMA sink from a SAL module.
++ * That graph is kept as the fallback control case below; the TDM graph above
++ * replaces both ends with the shared-memory writer and the TDM sink.
+  */
+ static void
+ g_audio_graph_cfg(uint32_t src_port)
+@@ -1543,8 +1547,11 @@
+  * AW882xx amplifiers hang off the LPASS TDM/I2S lines.  The vendor's capture
+  * graph proves the endpoint family and its configuration (TDM interface 2,
+  * 4 slots of 32 bit, slots 0/1 active, internal sync, 96 kHz / 32 bit).
+- * Build the same endpoint as a playback sink (MODULE_ID_TDM_SINK 0x0700100e,
+- * input port 2) and let SAL convert our 48 kHz / 16 bit buffers.
++ *
++ * The graph's input must be MODULE_ID_WR_SHARED_MEM_EP (0x07001000), not the
++ * SAL module the AGM table happens to use: only the shared-memory endpoint
++ * accepts PARAM_ID_MEDIA_FORMAT and the DATA_BUFFER_V2 stream.  Both the WR
++ * endpoint and the TDM sink run 96 kHz / 32 bit, so no converter is needed.
+  */
+ static void
+ g_audio_graph_cfg_tdm(uint32_t src_port)
+@@ -1578,30 +1585,23 @@
+ 	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001176, &v, 4,
+ 	    "tdm/power_mode");
+ 
+-	/* PARAM_ID_MEDIA_FORMAT for SAL: the AP buffers are 48 kHz / 16 bit /
+-	 * stereo PCM (payload_media_fmt_pcm_t follows the 12-byte header). */
++	/* PARAM_ID_MEDIA_FORMAT for the write-shared-memory endpoint: the AP
++	 * buffers are 96 kHz / 32 bit / stereo PCM.  payload_size is 18 and
++	 * the whole parameter body is 30 bytes, exactly like the vendor's. */
+ 	g_put32(sal_mf + 0, 1);                 /* fixed point */
+ 	g_put32(sal_mf + 4, 0x09001000);        /* MEDIA_FMT_ID_PCM */
+ 	g_put32(sal_mf + 8, 18);                /* PCM payload size */
+-	g_put32(sal_mf + 12, 48000);
+-	sal_mf[16] = 16; sal_mf[17] = 0;        /* bit_width */
++	g_put32(sal_mf + 12, 96000);
++	sal_mf[16] = 32; sal_mf[17] = 0;        /* bit_width */
+ 	sal_mf[18] = 1;                         /* alignment */
+-	sal_mf[19] = 1;                         /* interleaved */
+-	sal_mf[20] = 16; sal_mf[21] = 0;        /* bits_per_sample */
+-	sal_mf[22] = 15; sal_mf[23] = 0;        /* q_factor */
++	sal_mf[19] = 0;                         /* 0 = interleaved */
++	sal_mf[20] = 32; sal_mf[21] = 0;        /* bits_per_sample */
++	sal_mf[22] = 31; sal_mf[23] = 0;        /* q_factor */
+ 	sal_mf[24] = 1;  sal_mf[25] = 0;        /* endianness */
+ 	sal_mf[26] = 2;  sal_mf[27] = 0;        /* channels */
+ 	sal_mf[28] = 1;  sal_mf[29] = 2;        /* L, R */
+-	sal_mf[30] = 0;  sal_mf[31] = 0;
+-	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800100c, sal_mf,
+-	    sizeof(sal_mf), "sal/media_format");
+-
+-	v = 32;                                 /* SAL output: 32 bit */
+-	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x08001016, &v, 4,
+-	    "sal/output_cfg");
+-	v = 1;
+-	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800101e, &v, 4,
+-	    "sal/limiter");
++	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800100c, sal_mf, 30,
++	    "wr/media_format");
+ }
+ 
+ /* PREPARE / START / STOP take a SUB_GRAPH_LIST {count, id}. */
+@@ -1644,21 +1644,24 @@
+ 
+ 	/*
+ 	 * The speakers are on the TDM lines, so the endpoint must be
+-	 * MODULE_ID_TDM_SINK, not CODEC_DMA_SINK.  The graph is otherwise the
+-	 * same SAL -> endpoint pair; only the module ID at a fixed offset in
+-	 * the serialised graph changes.
++	 * MODULE_ID_TDM_SINK, not CODEC_DMA_SINK, and the input must be the
++	 * write-shared-memory endpoint.  Only the two module IDs change at
++	 * fixed offsets in the serialised graph.
+ 	 */
+ 	memcpy(tdm_payload, g_graph_open_payload, sizeof(tdm_payload));
++	g_put32(tdm_payload + G_INPUT_MODULE_OFF, G_WR_MODULE_ID);
+ 	g_put32(tdm_payload + G_CDMA_MODULE_OFF, G_TDM_MODULE_ID);
+ 	if (g_apm_cmd(port, 1, tdm_payload, sizeof(tdm_payload),
+ 	    APM_CMD_GRAPH_OPEN, "graph_open/tdm-inline") == 0) {
+ 		g_audio_graph_cfg_tdm(port);
+-		if (g_apm_graph_start(port, APM_GRAPH_SG_ID) == 0) {
+-			if (g_apm_shm_map(0x2002u) == 0) {
++		/* Map the PCM region before START: the writer may validate
++		 * its backing region while the graph comes up. */
++		if (g_apm_shm_map(0x2002u) == 0) {
++			if (g_apm_graph_start(port, APM_GRAPH_SG_ID) == 0) {
+ 				g_audio_tone(port, G_SAL_IID);
+-			} else {
+-				printf("SWEET GLINK: no shared memory for PCM\n");
+ 			}
++		} else {
++			printf("SWEET GLINK: no shared memory for PCM\n");
+ 		}
+ 		return;
+ 	}

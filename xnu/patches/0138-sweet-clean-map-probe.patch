@@ -1,0 +1,80 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -808,6 +808,47 @@
+ 	g_put32(pkt + 20, 0x01001021u);         /* APM_CMD_GET_SPF_STATE */
+ 	printf("SWEET GLINK: APM get_spf_state\n");
+ 	g_send_gpr(pkt, n);
++}
++
++/* Same query, but wait for the answer so a dead/restarted APM is visible. */
++static void
++g_apm_state_query_sync(const char *tag)
++{
++	uint8_t pkt[32];
++	uint32_t n = 24;
++	static const uint32_t words[] = { 16, 20, 24, 28, 32, 36 };
++
++	memset(pkt, 0, sizeof(pkt));
++	g_put32(pkt + 0, (6u << 4) | (n << 8));
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
++	g_put32(pkt + 8, 1);
++	g_put32(pkt + 12, 1);
++	g_put32(pkt + 16, 2);
++	g_put32(pkt + 20, 0x01001021u);
++	sweet_log_sync();
++	g_rsp_ready = 0;
++	g_rsp_len = 0;
++	g_send_gpr(pkt, n);
++	for (unsigned i = 0; i < 2000; i += 5) {
++		g_drain(0);
++		if (g_rsp_ready) {
++			break;
++		}
++		g_wait(5);
++	}
++	if (!g_rsp_ready) {
++		printf("SWEET GLINK: spf_state %s: no rsp\n", tag);
++	} else {
++		printf("SWEET GLINK: spf_state %s len=%u", tag, g_rsp_len);
++		for (unsigned k = 0; k < sizeof(words) / sizeof(words[0]); k++) {
++			if (words[k] + 4 <= g_rsp_len) {
++				printf(" w%u=%#x", words[k],
++				    g_le32(g_rsp + words[k]));
++			}
++		}
++		printf("\n");
++	}
++	sweet_log_sync();
+ }
+ 
+ static void
+@@ -1419,7 +1460,7 @@
+ 	g_rsp_ready = 0;
+ 	g_rsp_len = 0;
+ 	g_send_gpr(pkt, pkt_size);
+-	for (unsigned i = 0; i < 2000; i += 5) {
++	for (unsigned i = 0; i < 4000; i += 5) {
+ 		g_drain(0);
+ 		if (g_rsp_ready) {
+ 			break;
+@@ -1621,14 +1662,13 @@
+ {
+ 	/* The vendor maps the PCM region from 0x2002 and feeds buffers from
+ 	 * the stream port 0x2011; graph commands stay on 0x2010. */
+-	/* Which physical ranges can the ADSP map at all?  The vendor's
+-	 * buffers live around 0x1FFE8000 (inside the 28 MB audio CMA pool);
+-	 * probe that, the pool base, and the 4 GB boundary.  Mapping alone
+-	 * touches no data. */
+-	(void)g_apm_map_probe(0x9fd00000u, 0u, 0x4000u, "adsp_carveout");
++	/* One clean probe per boot: the vendor's own buffer address
++	 * (0x1FFE8000, inside the 28 MB audio CMA pool).  Mapping alone
++	 * touches no data.  The SPF-state queries around it reveal whether
++	 * an illegal map restarts the ADSP. */
++	g_apm_state_query_sync("before_map");
+ 	(void)g_apm_map_probe(0x1ffe8000u, 0u, 0x5000u, "vendor_pa");
+-	(void)g_apm_map_probe(0x1fe00000u, 0u, 0x4000u, "audio_cma_base");
+-	(void)g_apm_map_probe(0x00000000u, 0x1u, 0x4000u, "ddr_4g");
++	g_apm_state_query_sync("after_map");
+ 	if (g_apm_shm_map(0x2002u) != 0 || g_shm_va == 0 || g_shm_pa == 0) {
+ 		printf("SWEET GLINK: pcm: no shared memory, tone skipped\n");
+ 		sweet_log_sync();

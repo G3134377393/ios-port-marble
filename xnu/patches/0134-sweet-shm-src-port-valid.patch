@@ -1,0 +1,14 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1331,7 +1331,10 @@
+ 	}
+ 	memset(pkt, 0, sizeof(pkt));
+ 	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
+-	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
++	/* The vendor sets src_port_valid (bit 16) on SHM_MAP only: the APM
++	 * needs the client port to bind the region's handle to it. */
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8) |
++	    0x10000u);
+ 	g_put32(pkt + 8, src_port);
+ 	g_put32(pkt + 12, 1);
+ 	g_put32(pkt + 16, 0x2000u);

@@ -1,0 +1,190 @@
+--- a/bsd/dev/sweet_glink.c	2026-10-24 11:22:02
++++ b/bsd/dev/sweet_glink.c	2026-10-24 11:22:02
+@@ -1152,17 +1152,20 @@
+ #define APM_CMD_GRAPH_OPEN                  0x01001000u
+ #define APM_CMD_GRAPH_PREPARE               0x01001001u
+ #define APM_CMD_GRAPH_START                 0x01001002u
++#define APM_CMD_SET_CFG                     0x01001006u
+ #define APM_CMD_SHARED_MEM_MAP_REGIONS      0x0100100Cu
+ #define APM_PARAM_ID_SUB_GRAPH_LIST         0x08001005u
+ #define APM_GRAPH_SG_ID                     0xb000013du
++#define G_SAL_IID                           0x483fu
++#define G_CDMA_IID                          0x4840u
+ #define APM_VENDOR_SG_ID                    0xb00000d5u
+ #define APM_SHM_POOL                        3u   /* SHMEM8_4K */
+ #define G_SHM_SIZE                          0x10000u
+ 
+ /* Send one APM command with the payload inlined in the GPR packet. */
+ static int
+-g_apm_cmd(uint32_t src_port, const uint8_t *payload, uint32_t plen,
+-    uint32_t opcode, const char *what)
++g_apm_cmd(uint32_t src_port, uint32_t dst_port, const uint8_t *payload,
++    uint32_t plen, uint32_t opcode, const char *what)
+ {
+ 	uint8_t pkt[24 + 16 + 512];
+ 	uint32_t pkt_size = 24 + 16 + plen;
+@@ -1174,7 +1177,7 @@
+ 	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
+ 	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
+ 	g_put32(pkt + 8, src_port);     /* GPR client port */
+-	g_put32(pkt + 12, 1);           /* dest_port: APM module */
++	g_put32(pkt + 12, dst_port);    /* 1 = APM, else module iid */
+ 	g_put32(pkt + 16, 0x100u + opcode);
+ 	g_put32(pkt + 20, opcode);
+ 	g_put32(pkt + 24 + 0, 0);       /* payload_address_lsw  (inline) */
+@@ -1183,8 +1186,8 @@
+ 	g_put32(pkt + 24 + 12, plen);   /* payload_size */
+ 	memcpy(pkt + 40, payload, plen);
+ 
+-	printf("SWEET GLINK: APM %s src=%#x (%u bytes)\n", what, src_port,
+-	    pkt_size);
++	printf("SWEET GLINK: APM %s src=%#x dst=%#x (%u bytes)\n", what,
++	    src_port, dst_port, pkt_size);
+ 	sweet_log_sync();
+ 	g_rsp_ready = 0;
+ 	g_rsp_len = 0;
+@@ -1339,6 +1342,66 @@
+ 	return -1;
+ }
+ 
++/* One SET_CFG parameter block: {iid, param_id, size, 0} + data, padded to 8.
++ * The vendor sends these to the module instance port itself (dst=0x4308 etc.),
++ * which is what the APM expects for module-targeted configuration. */
++static int
++g_apm_set_cfg(uint32_t src_port, uint32_t mod_iid, uint32_t pid,
++    const void *data, uint32_t dlen, const char *what)
++{
++	uint8_t pl[16 + 64];
++	uint32_t plen;
++
++	if (dlen > 64) {
++		return -1;
++	}
++	memset(pl, 0, sizeof(pl));
++	g_put32(pl + 0, mod_iid);
++	g_put32(pl + 4, pid);
++	g_put32(pl + 8, dlen);
++	memcpy(pl + 16, data, dlen);
++	plen = (16 + dlen + 7u) & ~7u;
++	return g_apm_cmd(src_port, mod_iid, pl, plen, APM_CMD_SET_CFG, what);
++}
++
++/*
++ * Media format for the two modules of the simple playback graph.  The vendor
++ * runs its hardware endpoint at 96 kHz / 32 bit and puts an MFC in front of
++ * it; this graph has no MFC, so both ends carry the same 48 kHz / 16 bit /
++ * stereo PCM that we feed from the AP.
++ */
++static void
++g_audio_graph_cfg(uint32_t src_port)
++{
++	uint8_t mf[12], intf[12];
++	uint32_t v;
++
++	g_put32(mf + 0, 48000);
++	g_put32(mf + 4, 16u | (2u << 16));      /* bit_width, num_channels */
++	g_put32(mf + 8, 0);                     /* data_format: fixed point */
++
++	v = 16;
++	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x08001016, &v, 4,
++	    "sal/output_cfg");
++	v = 1;
++	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800101e, &v, 4,
++	    "sal/limiter");
++
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001017, mf, 12,
++	    "cdma/mf_cfg");
++	v = 1;
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001018, &v, 4,
++	    "cdma/frame_size");
++	g_put32(intf + 0, 3);                   /* lpaif_type: VA */
++	g_put32(intf + 4, 1);                   /* RX0 */
++	g_put32(intf + 8, 3);                   /* two channels active */
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001063, intf, 12,
++	    "cdma/intf_cfg");
++	v = 0;
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001176, &v, 4,
++	    "cdma/power_mode");
++}
++
+ /* PREPARE / START / STOP take a SUB_GRAPH_LIST {count, id}. */
+ static int
+ g_apm_graph_ctrl(uint32_t src_port, uint32_t sg_id, uint32_t opcode,
+@@ -1353,7 +1416,7 @@
+ 	g_put32(pl + 12, 0);                    /* error_code */
+ 	g_put32(pl + 16, 1);                    /* num_sub_graphs */
+ 	g_put32(pl + 20, sg_id);
+-	return g_apm_cmd(src_port, pl, sizeof(pl), opcode, what);
++	return g_apm_cmd(src_port, 1, pl, sizeof(pl), opcode, what);
+ }
+ 
+ static void
+@@ -1374,8 +1437,10 @@
+ 	const uint32_t port = 0x2010u;
+ 
+ 	/* Inline (mainline style) keeps working as the control case. */
+-	if (g_apm_cmd(port, g_graph_open_payload, sizeof(g_graph_open_payload),
+-	    APM_CMD_GRAPH_OPEN, "graph_open/inline") == 0) {
++	if (g_apm_cmd(port, 1, g_graph_open_payload,
++	    sizeof(g_graph_open_payload), APM_CMD_GRAPH_OPEN,
++	    "graph_open/inline") == 0) {
++		g_audio_graph_cfg(port);
+ 		g_apm_graph_start(port, APM_GRAPH_SG_ID);
+ 		return;
+ 	}
+@@ -1387,6 +1452,7 @@
+ 	}
+ 	if (g_apm_graph_open_shm(port, g_graph_open_payload,
+ 	    sizeof(g_graph_open_payload), "graph_open/shm") == 0) {
++		g_audio_graph_cfg(port);
+ 		g_apm_graph_start(port, APM_GRAPH_SG_ID);
+ 		return;
+ 	}
+--- a/bsd/dev/sweet_i2c.c	2026-10-24 11:22:02
++++ b/bsd/dev/sweet_i2c.c	2026-10-24 11:22:02
+@@ -25,6 +25,8 @@
+ #define SW_I2C_TLMM_SZ  0x2000u
+ #define SW_I2C_SCL      0u
+ #define SW_I2C_SDA      1u
++#define SW_AMP_RST_A_PA 0x0f101000u     /* amp@34 reset: GPIO1 */
++#define SW_AMP_RST_B_PA 0x0f178000u     /* amp@35 reset: GPIO120 */
+ 
+ #define SW_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
+ #define SW_GPIO_IO(n)    (SW_GPIO_CFG(n) + 4u)
+@@ -33,6 +35,24 @@
+ static uint32_t sw_scl_cfg_saved, sw_sda_cfg_saved;
+ static int sw_i2c_ok;
+ 
++/* Both amplifier resets are active low; drive them high and give the chips
++ * a few milliseconds before the first address. */
++static void
++sw_gpio_drive_high(uint32_t pa)
++{
++	vm_offset_t v = ml_io_map(pa, 0x1000);
++	uint32_t cfg;
++
++	if (!v) {
++		return;
++	}
++	cfg = *(volatile uint32_t *)v;
++	cfg &= ~0x3ffu;
++	cfg |= (3u << 6) | 0x200u;      /* GPIO function, 8 mA, output */
++	*(volatile uint32_t *)v = cfg;
++	*(volatile uint32_t *)(v + 4) |= 2u;
++}
++
+ static uint32_t
+ sw_rd(uint32_t off)
+ {
+@@ -291,6 +311,11 @@
+ 	cfg_sda = sw_rd(SW_GPIO_CFG(SW_I2C_SDA));
+ 	printf("SWEET I2C: TLMM @%#x scl cfg=%#x sda cfg=%#x\n",
+ 	    SW_I2C_TLMM_PA, cfg_scl, cfg_sda);
++
++	sw_gpio_drive_high(SW_AMP_RST_A_PA);
++	sw_gpio_drive_high(SW_AMP_RST_B_PA);
++	delay(10);
++	printf("SWEET I2C: amplifier resets released\n");
+ 
+ 	sw_i2c_pins_up();
+ 	printf("SWEET I2C: bus idle, sda=%d\n", sw_sda_read());

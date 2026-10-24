@@ -22,6 +22,22 @@ userdata、不改 GPT。测试结束内核自己复位，手机回到 TWRP/Andro
 
 音频进展与下一步见 **[docs/audio-status.md](docs/audio-status.md)**。
 
+## 仓库不包含什么（重要）
+
+本仓库是公开的**纯代码、补丁与文档**仓库，**不包含任何 Apple、Qualcomm
+或小米的二进制文件**。完整跑通需要你自备：
+
+| 文件 | 来源 | 说明 |
+|---|---|---|
+| **D22AP 设备树** `d22ap.adt` | 你自己的 iPhone X（D22AP）iOS 16.7.16 IPSW | Apple 版权内容，**不可再分发** |
+| **ADSP 固件** `adsp2.mdt` + `adsp2.bNN` | 你自己的手机 `/vendor/firmware/` | Qualcomm / 小米专有固件 |
+| **HFS+ iOS 用户态镜像** | 你自己的 iPhone X IPSW / 设备 | Apple 版权；仓库不提供、也不提供获取渠道 |
+| Android NDK / Xcode+KDK / adb | Google / Apple 公开下载 | 工具链，公开可获取 |
+
+来源、提取命令、放置位置与许可说明详见
+**[docs/required-assets.md](docs/required-assets.md)**。
+**请不要把上述专有文件上传到本仓库或任何公开渠道。**
+
 ## 安全规则（请先读）
 
 1. **只允许 `fastboot boot`**。禁止 `flash` / `erase` / `format` /
@@ -52,7 +68,9 @@ docs/                      音频状态、TDM、厂商图、SWEETLOG 等技术�
   提取命令见 `scripts/mkadt.py` 顶部注释。
 - 手机端需要 root 才能抽取 ADSP 固件（本机用 SukiSU Ultra）。
 - 一个已写入 userdata 尾部的 HFS+ 用户态镜像（Apple 内容，本项目不分发；
-  分区布局见 `docs/sweetlog.md`）。
+  分区布局见 `docs/sweetlog.md`，来源与风险见 `docs/required-assets.md`）。
+
+> 以上自备文件的完整清单、来源与法律说明见 **docs/required-assets.md**。
 
 ### 1. 构建 XNU 内核（GitHub Actions）
 

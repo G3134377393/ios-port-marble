@@ -1,0 +1,17 @@
+--- a/bsd/dev/sweet_i2c.c	2026-10-24 11:43:26
++++ b/bsd/dev/sweet_i2c.c	2026-10-24 11:43:26
+@@ -35,9 +35,11 @@
+ static uint32_t sw_scl_cfg_saved, sw_sda_cfg_saved;
+ static int sw_i2c_ok;
+ 
+-/* The DT reset-gpio flags are 0x2008: pull-up, and *not* GPIO_ACTIVE_LOW,
+- * so a high level asserts reset and a low level releases the chip.  Both
+- * levels are tried because a wrong guess looks exactly like a dead bus. */
++static int sw_aw_read(uint8_t addr, uint8_t reg, uint16_t *out);
++
++/* aw882xx_hw_reset uses gpiod_set_raw_value_cansleep: raw 0, delay, raw 1,
++ * delay.  Raw values ignore the active-low flag, so the chip is held in
++ * reset while the line is low and runs once it is pulled high. */
+ static void
+ sw_gpio_drive(uint32_t pa, bool high)
+ {

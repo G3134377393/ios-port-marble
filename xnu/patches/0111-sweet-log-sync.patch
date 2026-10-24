@@ -1,0 +1,51 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -726,6 +726,7 @@
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
++static uint64_t _Atomic sweet_log_flushed;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+@@ -771,6 +772,32 @@
+ sweet_log_position(void)
+ {
+ 	return os_atomic_load(&sweet_log_total, relaxed);
++}
++
++/*
++ * Push the ring to disk and wait (at most 3 s) until it is there.  Call
++ * this before an operation that may panic: the periodic flush only runs
++ * every ufslogsecs seconds, so the last second of console output would
++ * otherwise be lost exactly when it matters most.
++ */
++void sweet_log_sync(void);
++
++void
++sweet_log_sync(void)
++{
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++
++	if (os_atomic_load(&sweet_log_flushed, relaxed) >= total) {
++		return;
++	}
++	wakeup(&sweet_log_chan);
++	for (uint32_t i = 0; i < 3000; i++) {
++		if (os_atomic_load(&sweet_log_flushed, relaxed) >= total) {
++			return;
++		}
++		delay(1);
++	}
++	printf("SWEET LOG: sync timeout\n");
+ }
+ 
+ struct sweet_log_header {
+@@ -826,6 +853,7 @@
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed, total, relaxed);
+ 	}
+ }
+ 

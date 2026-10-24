@@ -1,0 +1,62 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -48,6 +48,9 @@
+ #define G_LPASS_RX_PA   0x03200000u     /* RX macro */
+ #define G_LPASS_VA_PA   0x033f0000u     /* VA macro */
+ 
++/* Force the console ring out to disk before a step that may panic. */
++extern void sweet_log_sync(void);       /* bsd/dev/sweet_ufs.c */
++
+ /* GLINK commands */
+ #define CMD_VERSION             0
+ #define CMD_VERSION_ACK         1
+@@ -1008,7 +1011,7 @@
+ 
+ 			printf("SWEET GLINK: reading rx_macro %#x\n",
+ 			    G_LPASS_RX_PA);
+-			g_wait(2000);   /* let the log ring reach the disk */
++			sweet_log_sync();   /* a panic must not eat these lines */
+ 			rx = g_win_map(win, G_LPASS_RX_PA, 16);
+ 			printf("SWEET GLINK: rx_macro %08x %08x %08x %08x\n",
+ 			    *(volatile uint32_t *)(rx + 0x0),
+@@ -1028,7 +1031,7 @@
+ 
+ 			printf("SWEET GLINK: reading va_macro %#x\n",
+ 			    G_LPASS_VA_PA);
+-			g_wait(2000);   /* let the log ring reach the disk */
++			sweet_log_sync();   /* a panic must not eat these lines */
+ 			va = g_win_map(win, G_LPASS_VA_PA, 16);
+ 			printf("SWEET GLINK: va_macro %08x %08x %08x %08x\n",
+ 			    *(volatile uint32_t *)(va + 0x0),
+@@ -1104,6 +1107,7 @@
+ 	}
+ 
+ 	/* Cast the PRM vote and look at the reply. */
++	sweet_log_sync();
+ 	g_prm_vote_lpass();
+ 	for (unsigned i = 0; i < 3000; i += 5) {
+ 		g_drain(0);
+@@ -1124,6 +1128,7 @@
+ 	g_drain(100);
+ 
+ 	/* Second opinion: ask the APM core for its state. */
++	sweet_log_sync();
+ 	g_rsp_ready = 0;
+ 	g_rsp_len = 0;
+ 	g_apm_state_query();
+@@ -1143,9 +1148,13 @@
+ 
+ 	/* Clocks the AP needs before it may read inside those macros. */
+ 	{
+-		int va_clk = g_prm_vote_clock(0x307, 19200000);  /* VA_CORE_MCLK */
+-		int rx_clk = g_prm_vote_clock(0x30e, 19200000);  /* RX_CORE_MCLK */
++		int va_clk, rx_clk;
+ 
++		sweet_log_sync();
++		va_clk = g_prm_vote_clock(0x307, 19200000);      /* VA_CORE_MCLK */
++		sweet_log_sync();
++		rx_clk = g_prm_vote_clock(0x30e, 19200000);      /* RX_CORE_MCLK */
++
+ 		g_drain(100);
+ 		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);
+ 		g_lpass_probe(va_clk == 0, rx_clk == 0);

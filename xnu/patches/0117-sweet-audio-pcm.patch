@@ -1,0 +1,156 @@
+--- a/bsd/dev/sweet_glink.c	2026-10-24 11:23:22
++++ b/bsd/dev/sweet_glink.c	2026-10-24 11:23:22
+@@ -1364,6 +1364,98 @@
+ 	return g_apm_cmd(src_port, mod_iid, pl, plen, APM_CMD_SET_CFG, what);
+ }
+ 
++/* ---- PCM feed: 1 kHz stereo tone ---------------------------------------
++ * The vendor HAL puts PCM in the same mapped region and sends DATA_BUFFER_V2
++ * (0x0400100A, no APM header, 44-byte payload) to the input module; buf_addr
++ * is an offset inside the region and the DSP paces the AP with
++ * DATA_BUFFER_DONE_V2 (0x05001004).  One buffer is 288 frames, i.e. 6 ms at
++ * 48 kHz stereo 16-bit.
++ */
++#define APM_CMD_DATA_BUFFER_V2      0x0400100Au
++#define APM_RSP_DATA_BUFFER_DONE_V2 0x05001004u
++#define G_PCM_OFF_A                 0x4000u
++#define G_PCM_OFF_B                 0x4800u
++#define G_PCM_BYTES                 1152u
++
++static const int16_t g_sine_48[48] = {
++	0, 1069, 2120, 3135, 4096, 4987, 5793, 6499,
++	7094, 7568, 7913, 8122, 8192, 8122, 7913, 7568,
++	7094, 6499, 5793, 4987, 4096, 3135, 2120, 1069,
++	0, -1069, -2120, -3135, -4096, -4987, -5793, -6499,
++	-7094, -7568, -7913, -8122, -8192, -8122, -7913, -7568,
++	-7094, -6499, -5793, -4987, -4096, -3135, -2120, -1069,
++};
++
++static void
++g_fill_tone(uint32_t off)
++{
++	int16_t *p = (int16_t *)(g_shm_va + off);
++
++	for (uint32_t i = 0; i < G_PCM_BYTES / 4; i++) {
++		int16_t v = g_sine_48[i % 48];
++
++		p[2 * i] = v;
++		p[2 * i + 1] = v;
++	}
++}
++
++static int
++g_apm_data_buffer(uint32_t src_port, uint32_t dst_port, uint32_t off,
++    uint32_t len, uint32_t token)
++{
++	uint8_t pkt[24 + 44];
++	uint32_t pkt_size = sizeof(pkt);
++
++	memset(pkt, 0, sizeof(pkt));
++	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
++	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
++	g_put32(pkt + 8, src_port);
++	g_put32(pkt + 12, dst_port);
++	g_put32(pkt + 16, token);
++	g_put32(pkt + 20, APM_CMD_DATA_BUFFER_V2);
++	g_put32(pkt + 24 + 0, off);             /* offset inside the region */
++	g_put32(pkt + 24 + 4, 0);
++	g_put32(pkt + 24 + 8, g_shm_handle);
++	g_put32(pkt + 24 + 12, len);
++	g_rsp_ready = 0;
++	g_rsp_len = 0;
++	g_send_gpr(pkt, pkt_size);
++	for (unsigned i = 0; i < 100; i += 5) {
++		g_drain(0);
++		if (g_rsp_ready) {
++			break;
++		}
++		g_wait(5);
++	}
++	if (!g_rsp_ready || g_rsp_len < 40) {
++		return -1;
++	}
++	if (g_le32(g_rsp + 20) != APM_RSP_DATA_BUFFER_DONE_V2) {
++		return -1;
++	}
++	return g_le32(g_rsp + 36) == 0 ? 0 : -1;
++}
++
++static void
++g_audio_tone(uint32_t src_port, uint32_t dst_port)
++{
++	g_fill_tone(G_PCM_OFF_A);
++	g_fill_tone(G_PCM_OFF_B);
++	flush_dcache64((addr64_t)(g_shm_pa + G_PCM_OFF_A), 0x1000, 1);
++	printf("SWEET GLINK: pcm tone start (dst=%#x)\n", dst_port);
++
++	for (int n = 0; n < 500; n++) {
++		uint32_t off = (n & 1) ? G_PCM_OFF_B : G_PCM_OFF_A;
++
++		if (g_apm_data_buffer(src_port, dst_port, off, G_PCM_BYTES,
++		    (uint32_t)(n & 1)) != 0) {
++			printf("SWEET GLINK: pcm buffer %d not consumed\n", n);
++			return;
++		}
++	}
++	printf("SWEET GLINK: pcm tone done (500 buffers)\n");
++}
++
+ /*
+  * Media format for the two modules of the simple playback graph.  The vendor
+  * runs its hardware endpoint at 96 kHz / 32 bit and puts an MFC in front of
+@@ -1419,15 +1511,18 @@
+ 	return g_apm_cmd(src_port, 1, pl, sizeof(pl), opcode, what);
+ }
+ 
+-static void
++static int
+ g_apm_graph_start(uint32_t src_port, uint32_t sg_id)
+ {
+ 	if (g_apm_graph_ctrl(src_port, sg_id, APM_CMD_GRAPH_PREPARE,
+ 	    "graph_prepare") != 0) {
+-		return;
++		return -1;
+ 	}
+-	(void)g_apm_graph_ctrl(src_port, sg_id, APM_CMD_GRAPH_START,
+-	    "graph_start");
++	if (g_apm_graph_ctrl(src_port, sg_id, APM_CMD_GRAPH_START,
++	    "graph_start") != 0) {
++		return -1;
++	}
++	return 0;
+ }
+ 
+ static void
+@@ -1441,7 +1536,14 @@
+ 	    sizeof(g_graph_open_payload), APM_CMD_GRAPH_OPEN,
+ 	    "graph_open/inline") == 0) {
+ 		g_audio_graph_cfg(port);
+-		g_apm_graph_start(port, APM_GRAPH_SG_ID);
++		if (g_apm_graph_start(port, APM_GRAPH_SG_ID) == 0) {
++			/* The tone needs a mapped region for the PCM buffers. */
++			if (g_apm_shm_map(0x2002u) == 0) {
++				g_audio_tone(port, G_SAL_IID);
++			} else {
++				printf("SWEET GLINK: no shared memory for PCM\n");
++			}
++		}
+ 		return;
+ 	}
+ 
+@@ -1453,7 +1555,14 @@
+ 	if (g_apm_graph_open_shm(port, g_graph_open_payload,
+ 	    sizeof(g_graph_open_payload), "graph_open/shm") == 0) {
+ 		g_audio_graph_cfg(port);
+-		g_apm_graph_start(port, APM_GRAPH_SG_ID);
++		if (g_apm_graph_start(port, APM_GRAPH_SG_ID) == 0) {
++			/* The tone needs a mapped region for the PCM buffers. */
++			if (g_apm_shm_map(0x2002u) == 0) {
++				g_audio_tone(port, G_SAL_IID);
++			} else {
++				printf("SWEET GLINK: no shared memory for PCM\n");
++			}
++		}
+ 		return;
+ 	}
+ 	if (g_apm_graph_open_shm(port, g_graph_vendor_payload,

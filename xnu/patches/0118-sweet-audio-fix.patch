@@ -1,0 +1,164 @@
+--- a/bsd/dev/sweet_glink.c	2026-10-24 11:34:08
++++ b/bsd/dev/sweet_glink.c	2026-10-24 11:34:08
+@@ -1466,29 +1466,52 @@
+ g_audio_graph_cfg(uint32_t src_port)
+ {
+ 	uint8_t mf[12], intf[12];
+-	uint32_t v;
++	uint32_t v, width = 16;
++	int i, ok = 0;
+ 
+-	g_put32(mf + 0, 48000);
+-	g_put32(mf + 4, 16u | (2u << 16));      /* bit_width, num_channels */
+-	g_put32(mf + 8, 0);                     /* data_format: fixed point */
++	/* This firmware rejects data_format 0: fixed point is 1.  The vendor
++	 * endpoint runs 96 kHz / 32 bit; try that when 48 kHz / 16 bit is
++	 * refused, and make the SAL width follow whatever was accepted. */
++	for (i = 0; i < 2; i++) {
++		uint32_t rate = i ? 96000 : 48000;
+ 
+-	v = 16;
++		width = i ? 32 : 16;
++		g_put32(mf + 0, rate);
++		g_put32(mf + 4, width | (2u << 16));    /* bit_width, channels */
++		g_put32(mf + 8, 1);                     /* DATA_FORMAT_FIXED_POINT */
++		if (g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001017, mf, 12,
++		    "cdma/mf_cfg") == 0) {
++			ok = 1;
++			break;
++		}
++	}
++	if (!ok) {
++		printf("SWEET GLINK: cdma media format rejected at 48k and 96k\n");
++	}
++
++	v = width;
+ 	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x08001016, &v, 4,
+ 	    "sal/output_cfg");
+ 	v = 1;
+ 	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800101e, &v, 4,
+ 	    "sal/limiter");
+ 
+-	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001017, mf, 12,
+-	    "cdma/mf_cfg");
+ 	v = 1;
+ 	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001018, &v, 4,
+ 	    "cdma/frame_size");
+-	g_put32(intf + 0, 3);                   /* lpaif_type: VA */
+-	g_put32(intf + 4, 1);                   /* RX0 */
+-	g_put32(intf + 8, 3);                   /* two channels active */
+-	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001063, intf, 12,
+-	    "cdma/intf_cfg");
++
++	/* Interface instance numbering is the last unknown: RX0 is 1 in
++	 * upstream headers, but try 0 as well if the module says no. */
++	for (i = 0; i < 2; i++) {
++		g_put32(intf + 0, 3);                   /* lpaif_type: VA */
++		g_put32(intf + 4, i ? 0 : 1);           /* RX0 */
++		g_put32(intf + 8, 3);                   /* two channels */
++		if (g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001063, intf, 12,
++		    "cdma/intf_cfg") == 0) {
++			break;
++		}
++	}
++
+ 	v = 0;
+ 	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001176, &v, 4,
+ 	    "cdma/power_mode");
+--- a/bsd/dev/sweet_i2c.c	2026-10-24 11:34:08
++++ b/bsd/dev/sweet_i2c.c	2026-10-24 11:34:08
+@@ -35,10 +35,11 @@
+ static uint32_t sw_scl_cfg_saved, sw_sda_cfg_saved;
+ static int sw_i2c_ok;
+ 
+-/* Both amplifier resets are active low; drive them high and give the chips
+- * a few milliseconds before the first address. */
++/* The DT reset-gpio flags are 0x2008: pull-up, and *not* GPIO_ACTIVE_LOW,
++ * so a high level asserts reset and a low level releases the chip.  Both
++ * levels are tried because a wrong guess looks exactly like a dead bus. */
+ static void
+-sw_gpio_drive_high(uint32_t pa)
++sw_gpio_drive(uint32_t pa, bool high)
+ {
+ 	vm_offset_t v = ml_io_map(pa, 0x1000);
+ 	uint32_t cfg;
+@@ -50,9 +51,33 @@
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (3u << 6) | 0x200u;      /* GPIO function, 8 mA, output */
+ 	*(volatile uint32_t *)v = cfg;
+-	*(volatile uint32_t *)(v + 4) |= 2u;
++	if (high) {
++		*(volatile uint32_t *)(v + 4) |= 2u;
++	} else {
++		*(volatile uint32_t *)(v + 4) &= ~2u;
++	}
+ }
+ 
++/* Probe every 7-bit address once.  Reading register 0 is harmless even on
++ * devices that do not implement it: an address is counted only if the
++ * address byte itself was acknowledged. */
++static int
++sw_i2c_scan(const char *tag)
++{
++	int n = 0;
++
++	for (int a = 0x08; a <= 0x77; a++) {
++		uint16_t id = 0;
++
++		if (sw_aw_read((uint8_t)a, 0x00, &id) == 0) {
++			printf("SWEET I2C: %s device %#x reg0=%#x\n", tag, a, id);
++			n++;
++		}
++	}
++	printf("SWEET I2C: %s scan found %d device(s)\n", tag, n);
++	return n;
++}
++
+ static uint32_t
+ sw_rd(uint32_t off)
+ {
+@@ -110,7 +135,7 @@
+ static void
+ sw_i2c_delay(void)
+ {
+-	delay(2);       /* ~2 us per half period -> ~250 kHz */
++	delay(5);       /* ~5 us per half period -> ~100 kHz */
+ }
+ 
+ static void
+@@ -312,13 +337,31 @@
+ 	printf("SWEET I2C: TLMM @%#x scl cfg=%#x sda cfg=%#x\n",
+ 	    SW_I2C_TLMM_PA, cfg_scl, cfg_sda);
+ 
+-	sw_gpio_drive_high(SW_AMP_RST_A_PA);
+-	sw_gpio_drive_high(SW_AMP_RST_B_PA);
+-	delay(10);
+-	printf("SWEET I2C: amplifier resets released\n");
++	int found;
+ 
++	/* Vendor sequence (disassembled from aw882xx_hw_reset): raw 0, delay,
++	 * raw 1, delay.  The chip stays out of reset at the high level. */
++	sw_gpio_drive(SW_AMP_RST_A_PA, false);
++	sw_gpio_drive(SW_AMP_RST_B_PA, false);
++	delay(2);
++	sw_gpio_drive(SW_AMP_RST_A_PA, true);
++	sw_gpio_drive(SW_AMP_RST_B_PA, true);
++	delay(5);
++	printf("SWEET I2C: resets pulsed low->high\n");
++
+ 	sw_i2c_pins_up();
+ 	printf("SWEET I2C: bus idle, sda=%d\n", sw_sda_read());
++	found = sw_i2c_scan("released");
++
++	if (found == 0) {
++		/* Diagnostic: with reset asserted, nothing should answer. */
++		sw_i2c_pins_down();
++		sw_gpio_drive(SW_AMP_RST_A_PA, false);
++		sw_gpio_drive(SW_AMP_RST_B_PA, false);
++		delay(5);
++		sw_i2c_pins_up();
++		(void)sw_i2c_scan("asserted");
++	}
+ 
+ 	for (int i = 0; i < 2; i++) {
+ 		uint16_t id = 0, sysst = 0, sysctrl = 0;

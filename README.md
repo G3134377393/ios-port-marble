@@ -65,6 +65,9 @@ Fork 本仓库后：
 - 等 30–60 分钟。成功后 release `kernel-latest` 会滚动更新，
   产物 `kernel.development.sweet`。
 
+> 不提供本地编译脚本：xnu-8796 需要 Xcode 15.x 的 `iig` 和对应的 KDK，
+> Actions 的 `macos-14` 环境已经配好；本地环境不一致会出现 IORPC ABI 错误。
+
 本地取回并打上本机需要的 CNTP_CTL 补丁：
 
 ```bash

@@ -5,3 +5,5 @@ logs/raw/
 shim/out-*/
 *.raw
 .DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,7 @@
+out/
+images/
+adsp-fw/
+logs/raw/
+shim/out-*/
+*.raw
+.DS_Store

@@ -1,0 +1,39 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1231,7 +1231,7 @@
+ #define G_CDMA_MODULE_OFF                   224u
+ #define APM_VENDOR_SG_ID                    0xb00000d5u
+ #define APM_SHM_POOL                        3u   /* SHMEM8_4K */
+-#define G_SHM_SIZE                          0x10000u
++#define G_SHM_SIZE                          0x5000u
+ 
+ /* Send one APM command with the payload inlined in the GPR packet. */
+ static int
+@@ -1308,7 +1308,14 @@
+ 		return 0;
+ 	}
+ 	if (!g_shm_va) {
++		/* The ADSP would not map a 64 KB buffer that landed above
++		 * 0x8_00000000; the vendor's regions sit around 5 GB.  Ask for
++		 * a page number below 8 GB, and fall back if that fails. */
+ 		if (kmem_alloc_contig(kernel_map, &g_shm_va, G_SHM_SIZE,
++		    PAGE_MASK, 0x200000u, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS &&
++		    kmem_alloc_contig(kernel_map, &g_shm_va, G_SHM_SIZE,
+ 		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+ 		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			g_shm_va = 0;
+@@ -1357,8 +1364,10 @@
+ 	printf("SWEET GLINK: shm_map rsp w24=%#x handle=%#x w32=%#x\n",
+ 	    g_le32(g_rsp + 24), g_shm_handle, g_le32(g_rsp + 32));
+ 	if (g_shm_handle == 0 || g_shm_handle == 0xffffffffu ||
+-	    g_le32(g_rsp + 24) != APM_CMD_SHARED_MEM_MAP_REGIONS) {
+-		printf("SWEET GLINK: shm_map: unexpected response\n");
++	    g_le32(g_rsp + 24) != APM_CMD_SHARED_MEM_MAP_REGIONS ||
++	    g_le32(g_rsp + 28) != 0) {
++		printf("SWEET GLINK: shm_map: failed (status=%#x)\n",
++		    g_le32(g_rsp + 28));
+ 		return -1;
+ 	}
+ 	g_shm_mapped = 1;

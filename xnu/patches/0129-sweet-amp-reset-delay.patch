@@ -1,0 +1,15 @@
+--- a/bsd/dev/sweet_i2c.c
++++ b/bsd/dev/sweet_i2c.c
+@@ -378,10 +378,10 @@
+ 	 * raw 1, delay.  The chip stays out of reset at the high level. */
+ 	sw_gpio_drive(SW_AMP_RST_A_PA, false);
+ 	sw_gpio_drive(SW_AMP_RST_B_PA, false);
+-	delay(2);
++	delay(2000);   /* the vendor msleep()s: delay() here is microseconds */
+ 	sw_gpio_drive(SW_AMP_RST_A_PA, true);
+ 	sw_gpio_drive(SW_AMP_RST_B_PA, true);
+-	delay(5);
++	delay(10000);  /* let the chip bring its I2C block up before the scan */
+ 	printf("SWEET I2C: resets pulsed low->high\n");
+ 
+ 	/* Level check: with the pin driven, the IO register should follow

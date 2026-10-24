@@ -25,18 +25,19 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_i2c.c
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,323 @@
 +/*
 + * SWEET: bit-banged I2C for the two AW882xx speaker amplifiers.
 + *
-+ * Marble puts them on i2c@880000, which is SCL=GPIO56 / SDA=GPIO57 on the
-+ * TLMM.  A GENI SE driver would be far more code than the job needs: bring
-+ * up only needs a chip-id read and then a few hundred register writes from
-+ * the ACF blob.  Bit-banging at ~250 kHz is plenty.
++ * Marble puts them on i2c@880000 (qup15), SCL=GPIO56 / SDA=GPIO57.  The
++ * TLMM register block is at 0x0f100000: the DT node pinctrl@f000000 starts
++ * one megabyte earlier, but the pin registers themselves are not there
++ * (patch 0086 hit the same wall with the touch controller).  The two pins
++ * therefore live at 0x0f138000 and 0x0f139000, so map only those pages.
 + *
-+ * The main TLMM node in the DT is pinctrl@f000000, but the touch driver
-+ * (proven on this board) reaches the same pins at 0x03900000; both windows
-+ * are printed at probe time so a wrong pick is obvious in the ring.
++ * A GENI SE driver would be far more code than bring-up needs: read the chip
++ * id, then write the vendor ACF's Music profile.  Bit-banging at ~250 kHz
++ * is plenty.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -48,11 +49,10 @@
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +
-+#define SW_I2C_TLMM_A    0x03900000u    /* what sweet_touch.c uses */
-+#define SW_I2C_TLMM_B    0x0f000000u    /* DT pinctrl@f000000 */
-+#define SW_I2C_TLMM_SZ   0x0080000u
-+#define SW_I2C_SCL       56u
-+#define SW_I2C_SDA       57u
++#define SW_I2C_TLMM_PA  0x0f138000u     /* pinctrl@f000000 + 56*0x1000 */
++#define SW_I2C_TLMM_SZ  0x2000u
++#define SW_I2C_SCL      0u
++#define SW_I2C_SDA      1u
 +
 +#define SW_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
 +#define SW_GPIO_IO(n)    (SW_GPIO_CFG(n) + 4u)
@@ -222,7 +222,7 @@
 +	return 0;
 +}
 +
-+static int __unused
++static int
 +sw_aw_write(uint8_t addr, uint8_t reg, uint16_t val)
 +{
 +	sw_i2c_start();
@@ -254,48 +254,71 @@
 +	sw_wr(SW_GPIO_CFG(SW_I2C_SDA), sw_sda_cfg_saved);
 +}
 +
-+/*
-+ * Print the chip id of both amplifiers.  0x2032 is PID 2032; the SYSCTRL
-+ * (0x04) and SYSST (0x01) registers give a little more state for free.
-+ */
++/* Music profile register table from the vendor's ACF (dde1 @0x410).
++ * 0x04 SYSCTRL differs between the two Music profiles only in bit 15;
++ * table A is the one with ULS_MODE set. */
++static const struct {
++	uint8_t reg;
++	uint16_t val;
++} aw882xx_music_a[44] = {
++	{ 0x03, 0xffff }, { 0x04, 0xb440 }, { 0x05, 0x05a9 }, { 0x06, 0x94e9 },
++	{ 0x07, 0x007d }, { 0x08, 0x2168 }, { 0x09, 0x3940 }, { 0x0a, 0x0030 },
++	{ 0x0b, 0x01e0 }, { 0x0c, 0x0064 }, { 0x0d, 0xa05b }, { 0x0e, 0x2392 },
++	{ 0x0f, 0xee80 }, { 0x15, 0x9838 }, { 0x20, 0x2001 }, { 0x30, 0x460c },
++	{ 0x31, 0xc989 }, { 0x32, 0x3541 }, { 0x33, 0x4db8 }, { 0x34, 0xd6f9 },
++	{ 0x35, 0x7ace }, { 0x36, 0xec7c }, { 0x37, 0x000c }, { 0x38, 0x0030 },
++	{ 0x50, 0x0080 }, { 0x52, 0x20c4 }, { 0x53, 0x0010 }, { 0x54, 0x0000 },
++	{ 0x55, 0x00d8 }, { 0x59, 0x000c }, { 0x5a, 0xc103 }, { 0x60, 0x0c0b },
++	{ 0x61, 0x6979 }, { 0x62, 0x04c1 }, { 0x63, 0x260f }, { 0x64, 0x15c3 },
++	{ 0x65, 0x8d05 }, { 0x66, 0x7f07 }, { 0x67, 0x0002 }, { 0x68, 0x3002 },
++	{ 0x69, 0x04a0 }, { 0x6a, 0xa068 }, { 0x6b, 0x8884 }, { 0x6c, 0x1000 },
++};
++
++/* Soft reset, then the vendor's Music profile. */
++static int
++sw_aw_init(uint8_t addr)
++{
++	int err = 0;
++
++	if (sw_aw_write(addr, 0x00, 0x55aa) != 0) {
++		return -1;
++	}
++	delay(2);
++	for (unsigned i = 0; i < sizeof(aw882xx_music_a) /
++	    sizeof(aw882xx_music_a[0]); i++) {
++		if (sw_aw_write(addr, aw882xx_music_a[i].reg,
++		    aw882xx_music_a[i].val) != 0) {
++			err++;
++		}
++	}
++	return err ? -1 : 0;
++}
++
 +void sweet_i2c_probe_amps(void);
 +
 +void
 +sweet_i2c_probe_amps(void)
 +{
 +	static const uint8_t addrs[2] = { 0x34, 0x35 };
-+	uint32_t cfg_a, cfg_b;
-+	int on = 1;
++	int on = 1, amp_on = 1;
++	uint32_t cfg_scl, cfg_sda;
 +
 +	(void)PE_parse_boot_argn("sweeti2c", &on, sizeof(on));
++	(void)PE_parse_boot_argn("sweetamp", &amp_on, sizeof(amp_on));
 +	if (!on) {
 +		printf("SWEET I2C: disabled (sweeti2c=0)\n");
 +		return;
 +	}
 +
-+	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_A, SW_I2C_TLMM_SZ);
-+	if (sw_i2c_gpio) {
-+		cfg_a = sw_rd(SW_GPIO_CFG(SW_I2C_SCL));
-+	} else {
-+		cfg_a = 0;
-+	}
-+
-+	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_B, SW_I2C_TLMM_SZ);
-+	cfg_b = sw_i2c_gpio ? sw_rd(SW_GPIO_CFG(SW_I2C_SCL)) : 0;
-+	printf("SWEET I2C: gpio56 cfg @03900000=%#x @0f000000=%#x\n",
-+	    cfg_a, cfg_b);
-+
-+	/* The touch driver proved 0x03900000 on this board; fall back only if
-+	 * that window reads back nothing sane. */
-+	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_A, SW_I2C_TLMM_SZ);
-+	if (!sw_i2c_gpio || cfg_a == 0 || cfg_a == 0xffffffff) {
-+		sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_B, SW_I2C_TLMM_SZ);
-+		printf("SWEET I2C: using 0f000000\n");
-+	}
++	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_PA, SW_I2C_TLMM_SZ);
 +	if (!sw_i2c_gpio) {
 +		printf("SWEET I2C: no TLMM mapping\n");
 +		return;
 +	}
++	cfg_scl = sw_rd(SW_GPIO_CFG(SW_I2C_SCL));
++	cfg_sda = sw_rd(SW_GPIO_CFG(SW_I2C_SDA));
++	printf("SWEET I2C: TLMM @%#x scl cfg=%#x sda cfg=%#x\n",
++	    SW_I2C_TLMM_PA, cfg_scl, cfg_sda);
 +
 +	sw_i2c_pins_up();
 +	printf("SWEET I2C: bus idle, sda=%d\n", sw_sda_read());
@@ -313,6 +336,12 @@
 +		    addrs[i], id, sysst, sysctrl);
 +		if (id == 0x2032) {
 +			sw_i2c_ok++;
++			if (amp_on) {
++				int rc = sw_aw_init(addrs[i]);
++
++				printf("SWEET I2C: amp %#x init %s\n",
++				    addrs[i], rc == 0 ? "ok" : "FAILED");
++			}
 +		}
 +	}
 +

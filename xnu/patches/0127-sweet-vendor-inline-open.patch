@@ -1,0 +1,39 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1238,7 +1238,7 @@
+ g_apm_cmd(uint32_t src_port, uint32_t dst_port, const uint8_t *payload,
+     uint32_t plen, uint32_t opcode, const char *what)
+ {
+-	uint8_t pkt[24 + 16 + 512];
++	uint8_t pkt[24 + 16 + 1024];
+ 	uint32_t pkt_size = 24 + 16 + plen;
+ 
+ 	if (plen > sizeof(pkt) - 40) {
+@@ -1805,10 +1805,24 @@
+ 	const uint32_t port = 0x2010u;
+ 	uint8_t tdm_payload[sizeof(g_graph_open_payload)];
+ 
+-	/* Try the vendor's real speaker graph first. */
+-	if (g_apm_shm_map(0x2002u) == 0) {
++	/* Try the vendor's real speaker graph first.  The simple graph only
++	 * ever opened when its payload rode inline, so do the same here
++	 * before falling back to shared memory. */
++	if (g_apm_cmd(port, 1, g_graph_vp, sizeof(g_graph_vp),
++	    APM_CMD_GRAPH_OPEN, "graph_open/vp-inline") == 0) {
++		g_audio_graph_cfg_vp(port);
++		if (g_apm_graph_start(port, APM_VP_SG_ID) == 0) {
++			g_audio_tone(port, G_VP_SAL_IID);
++		} else {
++			printf("SWEET GLINK: vendor graph opened but did not start\n");
++		}
++		return;
++	}
++	/* Shared memory: map from the same client port that sends the
++	 * command; a handle owned by another port may be rejected. */
++	if (g_apm_shm_map(port) == 0) {
+ 		if (g_apm_graph_open_shm(port, g_graph_vp,
+-		    sizeof(g_graph_vp), "graph_open/vp") == 0) {
++		    sizeof(g_graph_vp), "graph_open/vp-shm") == 0) {
+ 			g_audio_graph_cfg_vp(port);
+ 			if (g_apm_graph_start(port, APM_VP_SG_ID) == 0) {
+ 				g_audio_tone(port, G_VP_SAL_IID);

@@ -1,0 +1,22 @@
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -40,6 +40,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_adsp_init(void);
+ void sweet_glink_probe(void);
++extern void sweet_i2c_probe_amps(void);  /* bsd/dev/sweet_i2c.c */
+ 
+ #define PAS_ID          1
+ #define ADSP_REGION_PA  0x9fd00000u     /* live DT adsp_region@9fd00000 */
+@@ -407,6 +408,11 @@
+ 	}
+ 
+ 	printf("SWEET ADSP: ===== Q6 bring-up, start in 60s =====\n");
++	/* Probe the amplifiers before the ADSP boots and starts voting on
++	 * PMIC rails; Android's driver reads the chip id at ~3 s, long
++	 * before its audio stack runs. */
++	printf("SWEET ADSP: early amp probe\n");
++	sweet_i2c_probe_amps();
+ 	sa_wait(60000);
+ 
+ 	/* 1. Locate the firmware blob in /chosen/memory-map/RAMDisk. */

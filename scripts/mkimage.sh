@@ -37,6 +37,17 @@ CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=us
 for a in "$@"; do CMDLINE="$CMDLINE $a"; done
 
 mkdir -p "$OUT"
+
+# The ADT needs Apple's D22AP device tree (product metadata).  It is not in
+# this repo; extract it from YOUR iPhone X IPSW and point D22AP_ADT at it
+# (default: research/ipsw-x/d22ap.adt).
+BASE_ADT="${D22AP_ADT:-$ROOT/research/ipsw-x/d22ap.adt}"
+[ -f "$BASE_ADT" ] || {
+  echo "missing Apple base ADT: $BASE_ADT" >&2
+  echo "set D22AP_ADT=/path/to/d22ap.adt (see scripts/mkadt.py header)" >&2
+  exit 1; }
+D22AP_ADT="$BASE_ADT" python3 "$ROOT/scripts/mkadt.py" "$OUT/marble.adt" --highmem
+
 python3 "$ROOT/scripts/mkfwblob.py" "$FW_DIR" "$OUT/adsp2.fwblob"
 python3 "$ROOT/scripts/mkpayload.py" "$K" "$OUT/marble.adt" \
   "$OUT/marble-adsp.payload" --cmdline "$CMDLINE" \

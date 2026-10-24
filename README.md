@@ -47,6 +47,9 @@ docs/                      音频状态、TDM、厂商图、SWEETLOG 等技术�
 - 一台 bootloader 已解锁的 marble（本机：Redmi Note 12 Turbo，SM7475）。
 - macOS（Apple Silicon 或 Intel 均可）+ `adb` / `fastboot` / Python 3。
 - 构建 shim 需要 **Android NDK**（`ANDROID_NDK_HOME` 指向 NDK 目录）。
+- 构建 ADT 需要 Apple 的 **D22AP 设备树**（从你自己的 iPhone X IPSW 提取，
+  仓库不包含）：放到 `research/ipsw-x/d22ap.adt`，或设置 `D22AP_ADT`。
+  提取命令见 `scripts/mkadt.py` 顶部注释。
 - 手机端需要 root 才能抽取 ADSP 固件（本机用 SukiSU Ultra）。
 - 一个已写入 userdata 尾部的 HFS+ 用户态镜像（Apple 内容，本项目不分发；
   分区布局见 `docs/sweetlog.md`）。
@@ -82,7 +85,7 @@ SERIAL=2aa26095 ./scripts/extract_adsp_fw.sh
 ### 3. 生成 RAM-only 启动镜像
 
 ```bash
-ADSP_FW_DIR=$PWD/adsp-fw ./scripts/mkimage.sh
+D22AP_ADT=/path/to/d22ap.adt ADSP_FW_DIR=$PWD/adsp-fw ./scripts/mkimage.sh
 # 输出 images/shim-iosroot-adsp.img
 ```
 

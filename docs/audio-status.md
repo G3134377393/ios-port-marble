@@ -224,3 +224,16 @@ STATUS.md  本文件
    adsp_region，49 MB），只建映射不写数据 → 判断 SHM_MAP 是否只是受地址窗口限制
 2. 分配改为**递增上限扫描**：1/2/4/6/8/12 GB，取第一个成功并打印 PA
 3. 之后照常映射我们自己的缓冲区并发 tone
+
+## 2026-10-24 归档与仓库化
+- /tmp 里的本项目产物已全部迁入本目录：
+  `images/`（21 个镜像）、`kernels/`、`logs/`（含 raw ring gzip）、
+  `logs/build/`、`dumps/`、`refs/`（AudioReach/AW882xx/qdsp6/构建树）、
+  `src-history/`、`patches/`
+- 后续实验不再写 /tmp：构建与拉日志脚本都使用本目录/仓库内路径
+- GitHub `jebbranch/ios-port-marble` 已补充：
+  `shim/`（shim 源码）、`scripts/`（fetch_kernel / mkimage / boot_ram /
+  pull_logs / extract_adsp_fw）、`docs/`（audio-status / sound-plan /
+  vendor-graph / sweetlog），README 重写为“克隆→构建→部署”全流程
+- recovery（TWRP）adbd 为 root，XNU 结束后可直接 dd userdata 尾部，
+  不必等 Android 启动

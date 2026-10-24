@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -1567,6 +1567,23 @@
+ 	};
+ 	uint8_t mf[12], sal_mf[32];
+ 	uint32_t v;
++
++	/* PARAM_ID_MEDIA_FORMAT for both ends: the WR writes 96 kHz / 32 bit
++	 * stereo, and the sink's graph-side input must match it. */
++	g_put32(sal_mf + 0, 1);                 /* fixed point */
++	g_put32(sal_mf + 4, 0x09001000);        /* MEDIA_FMT_ID_PCM */
++	g_put32(sal_mf + 8, 18);                /* PCM payload size */
++	g_put32(sal_mf + 12, 96000);
++	sal_mf[16] = 32; sal_mf[17] = 0;        /* bit_width */
++	sal_mf[18] = 1;                         /* alignment */
++	sal_mf[19] = 0;                         /* 0 = interleaved */
++	sal_mf[20] = 32; sal_mf[21] = 0;        /* bits_per_sample */
++	sal_mf[22] = 31; sal_mf[23] = 0;        /* q_factor */
++	sal_mf[24] = 1;  sal_mf[25] = 0;        /* endianness */
++	sal_mf[26] = 2;  sal_mf[27] = 0;        /* channels */
++	sal_mf[28] = 1;  sal_mf[29] = 2;        /* L, R */
++	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x0800100c, sal_mf, 30,
++	    "tdm/media_format");
+ 
+ 	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x0800101b, tdm_intf,
+ 	    sizeof(tdm_intf), "tdm/intf");
+@@ -1585,21 +1602,15 @@
+ 	(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x08001176, &v, 4,
+ 	    "tdm/power_mode");
+ 
+-	/* PARAM_ID_MEDIA_FORMAT for the write-shared-memory endpoint: the AP
+-	 * buffers are 96 kHz / 32 bit / stereo PCM.  payload_size is 18 and
+-	 * the whole parameter body is 30 bytes, exactly like the vendor's. */
+-	g_put32(sal_mf + 0, 1);                 /* fixed point */
+-	g_put32(sal_mf + 4, 0x09001000);        /* MEDIA_FMT_ID_PCM */
+-	g_put32(sal_mf + 8, 18);                /* PCM payload size */
+-	g_put32(sal_mf + 12, 96000);
+-	sal_mf[16] = 32; sal_mf[17] = 0;        /* bit_width */
+-	sal_mf[18] = 1;                         /* alignment */
+-	sal_mf[19] = 0;                         /* 0 = interleaved */
+-	sal_mf[20] = 32; sal_mf[21] = 0;        /* bits_per_sample */
+-	sal_mf[22] = 31; sal_mf[23] = 0;        /* q_factor */
+-	sal_mf[24] = 1;  sal_mf[25] = 0;        /* endianness */
+-	sal_mf[26] = 2;  sal_mf[27] = 0;        /* channels */
+-	sal_mf[28] = 1;  sal_mf[29] = 2;        /* L, R */
++	/* PARAM_ID_HW_INTF_CLK_CFG: default clock id/root, 12.288 MHz
++	 * (96 kHz x 4 slots x 32 bit). */
++	{
++		uint32_t clk[4] = { 0, 12288000, 0, 0 };
++
++		(void)g_apm_set_cfg(src_port, G_CDMA_IID, 0x0800113c, clk,
++		    16, "tdm/clk_cfg");
++	}
++
+ 	(void)g_apm_set_cfg(src_port, G_SAL_IID, 0x0800100c, sal_mf, 30,
+ 	    "wr/media_format");
+ }

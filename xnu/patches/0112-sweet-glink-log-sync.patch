@@ -10,7 +10,73 @@
  /* GLINK commands */
  #define CMD_VERSION             0
  #define CMD_VERSION_ACK         1
-@@ -1008,7 +1011,7 @@
+@@ -716,7 +719,7 @@
+ /* Ask PRM for one LPASS clock (q6prm_set_lpass_clock equivalent).
+  * Returns 0 when the ADSP answered with status 0. */
+ static int
+-g_prm_vote_clock(uint32_t clk_id, uint32_t freq)
++g_prm_vote_clock_ex(uint32_t clk_id, uint32_t freq, uint32_t attr, uint32_t root)
+ {
+ 	uint8_t pkt[96];
+ 	uint32_t pkt_size = 24 + 16 + 36;
+@@ -741,9 +744,10 @@
+ 	g_put32(pkt + 56 + 0, 1);               /* num_clk_id */
+ 	g_put32(pkt + 56 + 4, clk_id);
+ 	g_put32(pkt + 56 + 8, freq);
+-	g_put32(pkt + 56 + 12, 0);              /* clock_attri */
+-	g_put32(pkt + 56 + 16, 0);              /* clock_root */
+-	printf("SWEET GLINK: PRM clk %#x @ %u Hz\n", clk_id, freq);
++	g_put32(pkt + 56 + 12, attr);           /* clock_attri */
++	g_put32(pkt + 56 + 16, root);           /* clock_root (DT ext-clk-src) */
++	printf("SWEET GLINK: PRM clk %#x @ %u attr=%u root=%u\n",
++	    clk_id, freq, attr, root);
+ 
+ 	g_rsp_ready = 0;
+ 	g_rsp_len = 0;
+@@ -760,14 +764,39 @@
+ 		return -1;
+ 	}
+ 	if (g_le32(g_rsp + 28) != 0) {
+-		printf("SWEET GLINK: clk %#x status %#x\n", clk_id,
+-		    g_le32(g_rsp + 28));
++		printf("SWEET GLINK: clk %#x attr=%u root=%u status %#x\n", clk_id,
++		    attr, root, g_le32(g_rsp + 28));
+ 		return -1;
+ 	}
+-	printf("SWEET GLINK: clk %#x ok\n", clk_id);
++	printf("SWEET GLINK: clk %#x attr=%u root=%u ok\n", clk_id, attr, root);
+ 	return 0;
+ }
+ 
++/*
++ * The vendor gets clock_attri from a driver constant and clock_root from the
++ * DT, so try the plausible attributes first and only then fall back to a
++ * root scan.  (va_core_clk: id 775/0x307 src 2; rx_core_clk: id 782/0x30e
++ * src 5 - see logs/dmesg-after-4320.txt.)
++ */
++static int
++g_prm_vote_clock(uint32_t clk_id, uint32_t freq, uint32_t root)
++{
++	for (uint32_t a = 0; a < 4; a++) {
++		if (g_prm_vote_clock_ex(clk_id, freq, a, root) == 0) {
++			return 0;
++		}
++	}
++	for (uint32_t r = 0; r < 8; r++) {
++		if (r == root) {
++			continue;
++		}
++		if (g_prm_vote_clock_ex(clk_id, freq, 0, r) == 0) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
+ /* APM_CMD_GET_SPF_STATE on the spf_core service: proves APM is alive even
+  * if the PRM vote is refused.  src_port and dest_port are both 1. */
+ static void
+@@ -1008,7 +1037,7 @@
  
  			printf("SWEET GLINK: reading rx_macro %#x\n",
  			    G_LPASS_RX_PA);
@@ -19,7 +85,7 @@
  			rx = g_win_map(win, G_LPASS_RX_PA, 16);
  			printf("SWEET GLINK: rx_macro %08x %08x %08x %08x\n",
  			    *(volatile uint32_t *)(rx + 0x0),
-@@ -1028,7 +1031,7 @@
+@@ -1028,7 +1057,7 @@
  
  			printf("SWEET GLINK: reading va_macro %#x\n",
  			    G_LPASS_VA_PA);
@@ -28,7 +94,7 @@
  			va = g_win_map(win, G_LPASS_VA_PA, 16);
  			printf("SWEET GLINK: va_macro %08x %08x %08x %08x\n",
  			    *(volatile uint32_t *)(va + 0x0),
-@@ -1104,6 +1107,7 @@
+@@ -1104,6 +1133,7 @@
  	}
  
  	/* Cast the PRM vote and look at the reply. */
@@ -36,7 +102,7 @@
  	g_prm_vote_lpass();
  	for (unsigned i = 0; i < 3000; i += 5) {
  		g_drain(0);
-@@ -1124,6 +1128,7 @@
+@@ -1124,6 +1154,7 @@
  	g_drain(100);
  
  	/* Second opinion: ask the APM core for its state. */
@@ -44,7 +110,7 @@
  	g_rsp_ready = 0;
  	g_rsp_len = 0;
  	g_apm_state_query();
-@@ -1143,9 +1148,13 @@
+@@ -1143,9 +1174,13 @@
  
  	/* Clocks the AP needs before it may read inside those macros. */
  	{
@@ -53,9 +119,9 @@
 +		int va_clk, rx_clk;
  
 +		sweet_log_sync();
-+		va_clk = g_prm_vote_clock(0x307, 19200000);      /* VA_CORE_MCLK */
++		va_clk = g_prm_vote_clock(0x307, 19200000, 2);   /* VA_CORE_MCLK */
 +		sweet_log_sync();
-+		rx_clk = g_prm_vote_clock(0x30e, 19200000);      /* RX_CORE_MCLK */
++		rx_clk = g_prm_vote_clock(0x30e, 22579200, 5);   /* RX_CORE_MCLK */
 +
  		g_drain(100);
  		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);

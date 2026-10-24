@@ -1,0 +1,321 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,4 +114,5 @@
+ bsd/dev/sweet_adsp.c			standard
+ bsd/dev/sweet_glink.c			standard
++bsd/dev/sweet_i2c.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -51,6 +51,7 @@
+ 
+ /* Force the console ring out to disk before a step that may panic. */
+ extern void sweet_log_sync(void);       /* bsd/dev/sweet_ufs.c */
++extern void sweet_i2c_probe_amps(void);  /* bsd/dev/sweet_i2c.c */
+ 
+ /* GLINK commands */
+ #define CMD_VERSION             0
+@@ -1326,6 +1327,7 @@
+ 		g_drain(100);
+ 		printf("SWEET GLINK: clocks va=%d rx=%d\n", va_clk, rx_clk);
+ 		g_apm_graph_bringup();
++		sweet_i2c_probe_amps();
+ 		g_lpass_probe(va_clk == 0, rx_clk == 0);
+ 	}
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_i2c.c
+@@ -0,0 +1,293 @@
++/*
++ * SWEET: bit-banged I2C for the two AW882xx speaker amplifiers.
++ *
++ * Marble puts them on i2c@880000, which is SCL=GPIO56 / SDA=GPIO57 on the
++ * TLMM.  A GENI SE driver would be far more code than the job needs: bring
++ * up only needs a chip-id read and then a few hundred register writes from
++ * the ACF blob.  Bit-banging at ~250 kHz is plenty.
++ *
++ * The main TLMM node in the DT is pinctrl@f000000, but the touch driver
++ * (proven on this board) reaches the same pins at 0x03900000; both windows
++ * are printed at probe time so a wrong pick is obvious in the ring.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SW_I2C_TLMM_A    0x03900000u    /* what sweet_touch.c uses */
++#define SW_I2C_TLMM_B    0x0f000000u    /* DT pinctrl@f000000 */
++#define SW_I2C_TLMM_SZ   0x0080000u
++#define SW_I2C_SCL       56u
++#define SW_I2C_SDA       57u
++
++#define SW_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
++#define SW_GPIO_IO(n)    (SW_GPIO_CFG(n) + 4u)
++
++static vm_offset_t sw_i2c_gpio;
++static uint32_t sw_scl_cfg_saved, sw_sda_cfg_saved;
++static int sw_i2c_ok;
++
++static uint32_t
++sw_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sw_i2c_gpio + off);
++}
++
++static void
++sw_wr(uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(sw_i2c_gpio + off) = val;
++}
++
++/* pull: 0 none, 3 pull-up (same encoding sweet_touch.c uses). */
++static void
++sw_gpio_cfg(unsigned pin, uint32_t pull, bool out)
++{
++	uint32_t off = SW_GPIO_CFG(pin);
++	uint32_t cfg = sw_rd(off);
++
++	cfg &= ~0x3ffu;
++	cfg |= (0u << 2) | pull | (3u << 6) | (out ? 0x200u : 0u);
++	sw_wr(off, cfg);
++}
++
++static void
++sw_scl(bool high)
++{
++	uint32_t off = SW_GPIO_IO(SW_I2C_SCL);
++	uint32_t v = sw_rd(off);
++
++	sw_wr(off, high ? (v | 2u) : (v & ~2u));
++}
++
++static void
++sw_sda(bool high)
++{
++	uint32_t off = SW_GPIO_IO(SW_I2C_SDA);
++
++	if (high) {
++		/* open-drain high: let the external pull-up do the work */
++		sw_wr(off, sw_rd(off) | 2u);
++		sw_gpio_cfg(SW_I2C_SDA, 3, false);
++	} else {
++		sw_wr(off, sw_rd(off) & ~2u);
++		sw_gpio_cfg(SW_I2C_SDA, 0, true);
++	}
++}
++
++static int
++sw_sda_read(void)
++{
++	return (int)(sw_rd(SW_GPIO_IO(SW_I2C_SDA)) & 1u);
++}
++
++static void
++sw_i2c_delay(void)
++{
++	delay(2);       /* ~2 us per half period -> ~250 kHz */
++}
++
++static void
++sw_i2c_start(void)
++{
++	sw_sda(1);
++	sw_scl(1);
++	sw_i2c_delay();
++	sw_sda(0);
++	sw_i2c_delay();
++	sw_scl(0);
++	sw_i2c_delay();
++}
++
++static void
++sw_i2c_stop(void)
++{
++	sw_sda(0);
++	sw_i2c_delay();
++	sw_scl(1);
++	sw_i2c_delay();
++	sw_sda(1);
++	sw_i2c_delay();
++}
++
++static int
++sw_i2c_write_byte(uint8_t b)
++{
++	int ack;
++
++	for (int i = 7; i >= 0; i--) {
++		sw_sda((b >> i) & 1);
++		sw_i2c_delay();
++		sw_scl(1);
++		sw_i2c_delay();
++		sw_scl(0);
++		sw_i2c_delay();
++	}
++	sw_sda(1);
++	sw_i2c_delay();
++	sw_scl(1);
++	sw_i2c_delay();
++	ack = sw_sda_read() == 0;
++	sw_scl(0);
++	sw_i2c_delay();
++	return ack;
++}
++
++static uint8_t
++sw_i2c_read_byte(int ack)
++{
++	uint8_t v = 0;
++
++	sw_sda(1);
++	for (int i = 7; i >= 0; i--) {
++		sw_i2c_delay();
++		sw_scl(1);
++		sw_i2c_delay();
++		v = (uint8_t)((v << 1) | (uint32_t)sw_sda_read());
++		sw_scl(0);
++		sw_i2c_delay();
++	}
++	if (ack) {
++		sw_sda(0);
++	} else {
++		sw_sda(1);
++	}
++	sw_i2c_delay();
++	sw_scl(1);
++	sw_i2c_delay();
++	sw_scl(0);
++	sw_i2c_delay();
++	sw_sda(1);
++	return v;
++}
++
++/* AW882xx: 8-bit register address, 16-bit data, high byte first. */
++static int
++sw_aw_read(uint8_t addr, uint8_t reg, uint16_t *out)
++{
++	uint8_t hi, lo;
++
++	sw_i2c_start();
++	if (!sw_i2c_write_byte((uint8_t)(addr << 1))) {
++		sw_i2c_stop();
++		return -1;
++	}
++	if (!sw_i2c_write_byte(reg)) {
++		sw_i2c_stop();
++		return -1;
++	}
++	sw_i2c_start();
++	if (!sw_i2c_write_byte((uint8_t)((addr << 1) | 1))) {
++		sw_i2c_stop();
++		return -1;
++	}
++	hi = sw_i2c_read_byte(1);
++	lo = sw_i2c_read_byte(0);
++	sw_i2c_stop();
++	*out = ((uint16_t)hi << 8) | lo;
++	return 0;
++}
++
++static int __unused
++sw_aw_write(uint8_t addr, uint8_t reg, uint16_t val)
++{
++	sw_i2c_start();
++	if (!sw_i2c_write_byte((uint8_t)(addr << 1)) ||
++	    !sw_i2c_write_byte(reg) ||
++	    !sw_i2c_write_byte((uint8_t)(val >> 8)) ||
++	    !sw_i2c_write_byte((uint8_t)(val & 0xff))) {
++		sw_i2c_stop();
++		return -1;
++	}
++	sw_i2c_stop();
++	return 0;
++}
++
++static void
++sw_i2c_pins_up(void)
++{
++	sw_scl_cfg_saved = sw_rd(SW_GPIO_CFG(SW_I2C_SCL));
++	sw_sda_cfg_saved = sw_rd(SW_GPIO_CFG(SW_I2C_SDA));
++	sw_gpio_cfg(SW_I2C_SCL, 3, true);
++	sw_wr(SW_GPIO_IO(SW_I2C_SCL), sw_rd(SW_GPIO_IO(SW_I2C_SCL)) | 2u);
++	sw_sda(1);
++}
++
++static void
++sw_i2c_pins_down(void)
++{
++	sw_wr(SW_GPIO_CFG(SW_I2C_SCL), sw_scl_cfg_saved);
++	sw_wr(SW_GPIO_CFG(SW_I2C_SDA), sw_sda_cfg_saved);
++}
++
++/*
++ * Print the chip id of both amplifiers.  0x2032 is PID 2032; the SYSCTRL
++ * (0x04) and SYSST (0x01) registers give a little more state for free.
++ */
++void sweet_i2c_probe_amps(void);
++
++void
++sweet_i2c_probe_amps(void)
++{
++	static const uint8_t addrs[2] = { 0x34, 0x35 };
++	uint32_t cfg_a, cfg_b;
++	int on = 1;
++
++	(void)PE_parse_boot_argn("sweeti2c", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET I2C: disabled (sweeti2c=0)\n");
++		return;
++	}
++
++	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_A, SW_I2C_TLMM_SZ);
++	if (sw_i2c_gpio) {
++		cfg_a = sw_rd(SW_GPIO_CFG(SW_I2C_SCL));
++	} else {
++		cfg_a = 0;
++	}
++
++	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_B, SW_I2C_TLMM_SZ);
++	cfg_b = sw_i2c_gpio ? sw_rd(SW_GPIO_CFG(SW_I2C_SCL)) : 0;
++	printf("SWEET I2C: gpio56 cfg @03900000=%#x @0f000000=%#x\n",
++	    cfg_a, cfg_b);
++
++	/* The touch driver proved 0x03900000 on this board; fall back only if
++	 * that window reads back nothing sane. */
++	sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_A, SW_I2C_TLMM_SZ);
++	if (!sw_i2c_gpio || cfg_a == 0 || cfg_a == 0xffffffff) {
++		sw_i2c_gpio = ml_io_map(SW_I2C_TLMM_B, SW_I2C_TLMM_SZ);
++		printf("SWEET I2C: using 0f000000\n");
++	}
++	if (!sw_i2c_gpio) {
++		printf("SWEET I2C: no TLMM mapping\n");
++		return;
++	}
++
++	sw_i2c_pins_up();
++	printf("SWEET I2C: bus idle, sda=%d\n", sw_sda_read());
++
++	for (int i = 0; i < 2; i++) {
++		uint16_t id = 0, sysst = 0, sysctrl = 0;
++
++		if (sw_aw_read(addrs[i], 0x00, &id) != 0) {
++			printf("SWEET I2C: amp %#x no ack\n", addrs[i]);
++			continue;
++		}
++		(void)sw_aw_read(addrs[i], 0x01, &sysst);
++		(void)sw_aw_read(addrs[i], 0x04, &sysctrl);
++		printf("SWEET I2C: amp %#x id=%#x sysst=%#x sysctrl=%#x\n",
++		    addrs[i], id, sysst, sysctrl);
++		if (id == 0x2032) {
++			sw_i2c_ok++;
++		}
++	}
++
++	sw_i2c_pins_down();
++	printf("SWEET I2C: %d amplifier(s) answered 0x2032\n", sw_i2c_ok);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

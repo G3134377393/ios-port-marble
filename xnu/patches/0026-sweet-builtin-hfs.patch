@@ -206,7 +206,7 @@ new file mode 100644
 +#undef QUOTA
 +#undef NAMEDSTREAMS
 +#undef FIFO
-+#undef HFS_COMPRESSION
++/* SWEET: keep HFS compression enabled so decmpfs types (3/4/7/8) register */
 +#include "core/kext-config.h"
 +
 +/* Built in, not a loadable kext (see sweet_hfs_iokit.c). */

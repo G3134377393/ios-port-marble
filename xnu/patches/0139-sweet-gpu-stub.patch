@@ -1,0 +1,140 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -940,7 +940,117 @@
+ 	(void)args;
+ 	if (selector == 6) {
+ 		return kIOReturnSuccess;	/* cdhash is trusted */
+ 	}
+ 	return kIOReturnUnsupported;
+ }
++/*
++ * SWEET GPU: minimal accelerator service stubs.
++ *
++ * backboardd retries IOServiceMatching("IOAcceleratorES") forever while that
++ * class is absent, so the render server never advances and the boot stops at
++ * the progress bar. These stubs satisfy the match and accept every user
++ * client call. They do not render anything; they only exist so the rest of
++ * the boot path can be observed without a real Adreno driver.
++ */
++class SweetGpuService : public IOService {
++	OSDeclareDefaultStructors(SweetGpuService);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGpuService, IOService);
++
++class SweetGpuUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetGpuUserClient);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGpuUserClient, IOUserClient);
++
++bool
++SweetGpuUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	return IOUserClient::initWithTask(owningTask, securityID, type);
++}
++
++IOReturn
++SweetGpuUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	uint32_t i;
++
++	if (args != NULL) {
++		for (i = 0; i < args->scalarOutputCount && args->scalarOutput != NULL; i++) {
++			args->scalarOutput[i] = 0;
++		}
++	}
++	IOLog("SWEET GPU: %s sel %u -> success (stub)\n", getName(), (unsigned)selector);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetGpuService::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    __unused OSDictionary *properties, IOUserClient **handler)
++{
++	IOUserClient *client;
++
++	client = OSTypeAlloc(SweetGpuUserClient);
++	if (!client) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityID, type)) {
++		client->release();
++		return kIOReturnBadArgument;
++	}
++	if (!client->attach(this)) {
++		client->release();
++		return kIOReturnUnsupported;
++	}
++	if (!client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnUnsupported;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++bool
++SweetGpuService::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetGpuUserClient");
++	registerService();
++	IOLog("SWEET GPU: %s registered (stub, no rendering)\n", getName());
++	return true;
++}
++
++class IOAcceleratorES : public SweetGpuService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, SweetGpuService);
++
++class IOAcceleratorESLegacy : public SweetGpuService {
++	OSDeclareDefaultStructors(IOAcceleratorESLegacy);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorESLegacy, SweetGpuService);
++
++class AGXAccelerator : public SweetGpuService {
++	OSDeclareDefaultStructors(AGXAccelerator);
++};
++
++OSDefineMetaClassAndStructors(AGXAccelerator, SweetGpuService);
+ #endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -66,2 +66,17 @@
+     "   {",
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },",
++    "   {",
++    "     'IOClass'         = IOAcceleratorESLegacy;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorESLegacy;"
++    "   },",
++    "   {",
++    "     'IOClass'         = AGXAccelerator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AGXAccelerator;"
++    "   },",
++    "   {",
+     "     'IOClass'         = AppleMobileFileIntegrity;",

@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -940,7 +940,117 @@
+@@ -937,7 +937,160 @@
  	(void)args;
  	if (selector == 6) {
  		return kIOReturnSuccess;	/* cdhash is trusted */
@@ -10,11 +10,9 @@
 +/*
 + * SWEET GPU: minimal accelerator service stubs.
 + *
-+ * backboardd retries IOServiceMatching("IOAcceleratorES") forever while that
-+ * class is absent, so the render server never advances and the boot stops at
-+ * the progress bar. These stubs satisfy the match and accept every user
-+ * client call. They do not render anything; they only exist so the rest of
-+ * the boot path can be observed without a real Adreno driver.
++ * backboardd retries IOServiceMatching("IOAcceleratorES") forever when the
++ * class is absent, so the render server never advances. These stubs satisfy
++ * the match and accept every user client call; they render nothing.
 + */
 +class SweetGpuService : public IOService {
 +	OSDeclareDefaultStructors(SweetGpuService);
@@ -88,6 +86,8 @@
 +	return kIOReturnSuccess;
 +}
 +
++static void sweet_autoreboot_start(void);
++
 +bool
 +SweetGpuService::start(IOService *provider)
 +{
@@ -97,6 +97,7 @@
 +	setProperty(kIOUserClientClassKey, "SweetGpuUserClient");
 +	registerService();
 +	IOLog("SWEET GPU: %s registered (stub, no rendering)\n", getName());
++	sweet_autoreboot_start();
 +	return true;
 +}
 +
@@ -117,11 +118,53 @@
 +};
 +
 +OSDefineMetaClassAndStructors(AGXAccelerator, SweetGpuService);
++
++
++/*
++ * SWEET AUTO REBOOT: optional self-reset timer for stuck-boot testing.
++ * Boot-arg: sweetautoreboot=<seconds>
++ */
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++static void
++sweet_autoreboot_thread(void *arg, wait_result_t wr)
++{
++	int secs = 0;
++
++	(void)arg;
++	(void)wr;
++	(void)PE_parse_boot_argn("sweetautoreboot", &secs, sizeof(secs));
++	if (secs <= 0) {
++		return;
++	}
++	if (secs > 24 * 3600) {
++		secs = 24 * 3600;
++	}
++	IOLog("SWEET AUTO REBOOT: panic in %d s\n", secs);
++	tsleep(&sweet_autoreboot_thread, PZERO, "swart", (unsigned)secs * hz);
++	panic("SWEET AUTO REBOOT after %d s", secs);
++}
++
++static void
++sweet_autoreboot_start(void)
++{
++	thread_t thread;
++	int secs = 0;
++
++	if (!PE_parse_boot_argn("sweetautoreboot", &secs, sizeof(secs)) || secs <= 0) {
++		return;
++	}
++	if (kernel_thread_start(&sweet_autoreboot_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
  #endif /* SWEET */
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -66,2 +66,17 @@
-     "   {",
+@@ -65,2 +65,17 @@
+     "   {"
 +    "     'IOClass'         = IOAcceleratorES;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = IOAcceleratorES;"
@@ -137,4 +180,4 @@
 +    "     'IOMatchCategory' = AGXAccelerator;"
 +    "   },",
 +    "   {",
-     "     'IOClass'         = AppleMobileFileIntegrity;",
+     "     'IOClass'         = AppleMobileFileIntegrity;"

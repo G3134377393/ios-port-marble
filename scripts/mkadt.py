@@ -136,7 +136,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # console works. Keep qcom,kryo470: the SweetCPU IONameMatch (0018) uses it.
     # QEMU retains its original single-CPU tree.
     cpu_nodes = []
-    for core, mpidr in enumerate([0] if qemu else [0x0, 0x100, 0x200, 0x300]):
+    for core, mpidr in enumerate([0] if qemu else [0x0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700]):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),

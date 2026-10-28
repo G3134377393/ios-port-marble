@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -937,7 +937,160 @@
+@@ -937,7 +937,163 @@
  	(void)args;
  	if (selector == 6) {
  		return kIOReturnSuccess;	/* cdhash is trusted */
@@ -125,7 +125,10 @@
 + * Boot-arg: sweetautoreboot=<seconds>
 + */
 +#include <kern/thread.h>
-+#include <kern/clock.h>
++#include <kern/debug.h>
++#include <sys/kernel.h>
++#include <sys/param.h>
++#include <sys/proc.h>
 +#include <pexpert/pexpert.h>
 +
 +static void

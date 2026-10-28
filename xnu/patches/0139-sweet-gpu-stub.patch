@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -937,7 +937,163 @@
+@@ -937,7 +937,169 @@
  	(void)args;
  	if (selector == 6) {
  		return kIOReturnSuccess;	/* cdhash is trusted */
@@ -131,6 +131,8 @@
 +#include <sys/proc.h>
 +#include <pexpert/pexpert.h>
 +
++static int sweet_autoreboot_chan;
++
 +static void
 +sweet_autoreboot_thread(void *arg, wait_result_t wr)
 +{
@@ -146,7 +148,11 @@
 +		secs = 24 * 3600;
 +	}
 +	IOLog("SWEET AUTO REBOOT: panic in %d s\n", secs);
-+	tsleep(&sweet_autoreboot_thread, PZERO, "swart", (unsigned)secs * hz);
++	while (secs > 0) {
++		int slice = secs > 10 ? 10 : secs;
++		tsleep(&sweet_autoreboot_chan, PZERO, "swart", (unsigned)slice * 100);
++		secs -= slice;
++	}
 +	panic("SWEET AUTO REBOOT after %d s", secs);
 +}
 +
@@ -171,16 +177,16 @@
 +    "     'IOClass'         = IOAcceleratorES;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = IOAcceleratorES;"
-+    "   },",
-+    "   {",
++    "   }"
++    "   {"
 +    "     'IOClass'         = IOAcceleratorESLegacy;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = IOAcceleratorESLegacy;"
-+    "   },",
-+    "   {",
++    "   }"
++    "   {"
 +    "     'IOClass'         = AGXAccelerator;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = AGXAccelerator;"
-+    "   },",
-+    "   {",
++    "   }"
++    "   {"
      "     'IOClass'         = AppleMobileFileIntegrity;"

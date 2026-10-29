@@ -1,0 +1,51 @@
+--- a/bsd/sweet_hfs/core/hfs_btreeio.c
++++ b/bsd/sweet_hfs/core/hfs_btreeio.c
+@@ -231,5 +231,37 @@
+ 	blockPtr->isModified = 1;
+ }
+ 
+ void
++/*
++ * SWEET HFS: a B-tree node buffer may already be in big-endian order (for
++ * example when it came straight from disk). Swapping it again corrupts the
++ * catalog ("offset #0 invalid"). Only convert when the record count in the
++ * node descriptor looks like a native-order value.
++ */
++static int
++sweet_hfs_node_is_host_order(char *dp, size_t n)
++{
++	u_int16_t nrec_host, nrec_be;
++	int host_ok, be_ok;
++
++	if (dp == NULL || n < 64) {
++		return 0;
++	}
++	memcpy(&nrec_host, dp + 10, sizeof(nrec_host));
++	nrec_be = (u_int16_t)((nrec_host >> 8) | (nrec_host << 8));
++	host_ok = (nrec_host > 0 && nrec_host < 0x2000);
++	be_ok = (nrec_be > 0 && nrec_be < 0x2000);
++	if (host_ok && !be_ok) {
++		return 1;
++	}
++	if (!host_ok && be_ok) {
++		static int warned;
++		if (!warned) {
++			printf("SWEET HFS: btree write: node already big-endian, not swapping\n");
++			warned = 1;
++		}
++		return 0;
++	}
++	return 1;
++}
+ btree_swap_node(struct buf *bp, __unused void *arg)
+@@ -251,5 +251,10 @@
+      * We allow swapping of zeroed out nodes here because we might
+      * be writing node whose last record just got deleted.
+      */
++	/* SWEET HFS: only swap nodes that really are in native byte order. */
++	if (!sweet_hfs_node_is_host_order((char *)buf_dataptr(bp), buf_count(bp))) {
++		return;
++	}
++
+     retval = hfs_swap_BTNode (&block, vp, kSwapBTNodeHostToBig, true);
+     if (retval)

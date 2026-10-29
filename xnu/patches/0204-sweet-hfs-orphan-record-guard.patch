@@ -1,0 +1,34 @@
+diff --git a/bsd/sweet_hfs/core/hfs_vfsutils.c b/bsd/sweet_hfs/core/hfs_vfsutils.c
+index 5734b67..b85c25b 100644
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -1713,12 +1713,29 @@ hfs_remove_orphans(struct hfsmount * hfsmp)
+ 	/* Visit all the temp files/dirs in the HFS+ private directory. */
+ 	for (;;) {
+ 		lockflags = hfs_systemfile_lock(hfsmp, SFL_CATALOG, HFS_EXCLUSIVE_LOCK);
++		/*
++		 * SWEET HFS: fill the whole record buffer with zeroes first.  A corrupt
++		 * catalog can return a short record, and BTIterateRecord only copies the
++		 * bytes it actually got; the rest of the stack buffer would otherwise
++		 * hold stale fork/extent data from the previous iteration.
++		 */
++		bzero(&filerec, sizeof(filerec));
+ 		result = BTIterateRecord(fcb, kBTreeNextRecord, iterator, &btdata, NULL);
+ 		hfs_systemfile_unlock(hfsmp, lockflags);
+ 		if (result)
+ 			break;
+ 		if (keyp->parentID != hfsmp->hfs_private_desc[FILE_HARDLINKS].cd_cnid)
+ 			break;
++
++		/*
++		 * SWEET HFS: only a file or folder record may be handed to
++		 * cat_convertattr()/cat_delete() here; anything else (e.g. a thread
++		 * record left behind by a corrupt catalog) is not an orphan file.
++		 */
++		if (filerec.recordType != kHFSPlusFolderRecord &&
++		    filerec.recordType != kHFSPlusFileRecord) {
++			continue;
++		}
+ 		
+ 		(void) utf8_encodestr(keyp->nodeName.unicode, keyp->nodeName.length * 2,
+ 		                      (u_int8_t *)filename, &namelen, sizeof(filename), 0, 0);

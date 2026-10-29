@@ -1,0 +1,97 @@
+diff --git a/bsd/sweet_hfs/core/hfs_btreeio.c b/bsd/sweet_hfs/core/hfs_btreeio.c
+index 7823466..477b28c 100644
+--- a/bsd/sweet_hfs/core/hfs_btreeio.c
++++ b/bsd/sweet_hfs/core/hfs_btreeio.c
+@@ -87,6 +87,31 @@ sweet_hfs_node_is_host_order(char *dp, size_t n)
+ 	return (last == 0x0e00) ? 0 : 1;
+ }
+ 
++/*
++ * SWEET HFS: true for a zeroed/never-initialized node (an unused node the
++ * B-tree wrote out with BTZeroUnusedNodes, or a freshly allocated block).
++ * Such a node carries no byte order information, so it must not be fed to
++ * hfs_swap_BTNode: with allow_empty_node clear it fails the record offset
++ * check with "offset #0 invalid (0x0000)".
++ */
++static int
++sweet_hfs_node_is_zeroed(char *dp, size_t n)
++{
++	size_t i;
++
++	if (dp == NULL || n < sizeof(BTNodeDescriptor) + sizeof(u_int16_t)) {
++		return 0;
++	}
++
++	for (i = 0; i < sizeof(BTNodeDescriptor); i++) {
++		if (dp[i] != 0) {
++			return 0;
++		}
++	}
++
++	return (dp[n - 2] == 0 && dp[n - 1] == 0);
++}
++
+ /* From bsd/vfs/vfs_bio.c */
+ extern int bdwrite_internal(struct buf *, int);
+ 
+@@ -203,7 +228,30 @@ OSStatus GetBTreeBlock(FileReference vp, u_int32_t blockNum, GetBlockOptions opt
+ 					 * The node was just read from disk, so always swap/check it.
+ 					 * This is necessary on big endian since the test below won't trigger.
+ 					 */
+-					retval = hfs_swap_BTNode (block, vp, kSwapBTNodeBigToHost, allow_empty_node);
++					if (sweet_hfs_node_is_zeroed((char *)block->buffer, block->blockSize)) {
++						static int warned_zeroed;
++
++						/*
++						 * SWEET HFS: a zeroed node has no byte order; leave it alone
++						 * instead of failing the offset table validation.
++						 */
++						if (!warned_zeroed) {
++							printf("SWEET HFS: zeroed btree node left unswapped\n");
++							warned_zeroed = 1;
++						}
++						retval = 0;
++					} else {
++						u_int8_t empty_ok = allow_empty_node;
++
++						/*
++						 * SWEET HFS: an empty (numRecords == 0) node still has to be
++						 * swapped, but has no record offsets to validate.
++						 */
++						if (*(u_int16_t *)((void *)((char *)block->buffer + 10)) == 0) {
++							empty_ok = true;
++						}
++						retval = hfs_swap_BTNode (block, vp, kSwapBTNodeBigToHost, empty_ok);
++					}
+ 				} 
+ 				else {
+ 					/*
+diff --git a/bsd/sweet_hfs/core/hfs_catalog.c b/bsd/sweet_hfs/core/hfs_catalog.c
+index 98fcb51..4c24d28 100644
+--- a/bsd/sweet_hfs/core/hfs_catalog.c
++++ b/bsd/sweet_hfs/core/hfs_catalog.c
+@@ -710,6 +710,24 @@ cat_lookupmangled(struct hfsmount *hfsmp, struct cat_desc *descp, int wantrsrc,
+ 	if (wantrsrc)
+ 		return (ENOENT);
+ 
++	/*
++	 * SWEET HFS: a corrupt catalog or an inconsistent cnode can hand us a
++	 * lookup descriptor with a wild name pointer or an absurd length.
++	 * GetEmbeddedFileID() dereferences it and would take a kernel data
++	 * abort (wild far address); treat such a descriptor as not found.
++	 */
++	if (descp == NULL || descp->cd_nameptr == NULL ||
++	    descp->cd_namelen <= 0 || descp->cd_namelen > MAXPATHLEN) {
++		static int warned_bad_desc;
++
++		if (!warned_bad_desc) {
++			printf("SWEET HFS: bad catalog descriptor (namelen %d)\n",
++			    descp ? (int)descp->cd_namelen : -1);
++			warned_bad_desc = 1;
++		}
++		return (ENOENT);
++	}
++
+ 	fileID = GetEmbeddedFileID(descp->cd_nameptr, descp->cd_namelen, &prefixlen);
+ 	if (fileID < (cnid_t)kHFSFirstUserCatalogNodeID)
+ 		return (ENOENT);

@@ -4,7 +4,6 @@
  	blockPtr->isModified = 1;
  }
  
- void
 +/*
 + * SWEET HFS: a B-tree node buffer may already be in big-endian order (for
 + * example when it came straight from disk). Swapping it again corrupts the
@@ -37,6 +36,7 @@
 +	}
 +	return 1;
 +}
+ void
  btree_swap_node(struct buf *bp, __unused void *arg)
 @@ -251,5 +251,10 @@
       * We allow swapping of zeroed out nodes here because we might

@@ -1,0 +1,169 @@
+--- a/iokit/Kernel/arm/SweetGpuDriver.cpp
++++ b/iokit/Kernel/arm/SweetGpuDriver.cpp
+@@ -1,76 +1,90 @@
+-/*
+- * SWEET GPU: Adreno 725 driver - stage 1 (MMIO probe only).
+- *
+- * Maps the GPU/GMU register windows from the marble hardware map
+- * (gpu-hw-map.md) and reads identification registers. Nothing is written
+- * to the GPU yet; this is the first step of the A725 bring-up.
+- */
+-#include <IOKit/IOLib.h>
+-#include <IOKit/IOService.h>
+-#include <stdint.h>
+-
+-extern "C" {
+-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+-}
+-
+-/* Hardware windows (from the marble device tree, see gpu-hw-map.md). */
+-#define SWEET_GPU_WIN_BASE   0x03d00000ULL
+-#define SWEET_GPU_WIN_SIZE   0x00040000ULL
+-#define SWEET_GPU_GMU_BASE   0x03d68000ULL
+-#define SWEET_GPU_GMU_SIZE   0x00037000ULL
+-#define SWEET_GPU_GMU2_BASE  0x0b290000ULL
+-#define SWEET_GPU_GMU2_SIZE  0x00010000ULL
+-#define SWEET_GPU_GMU3_BASE  0x03d40000ULL
+-#define SWEET_GPU_GMU3_SIZE  0x00010000ULL
+-
+-/* Register offsets (dword indices), see sweet_gpu_defs.h */
+-#define SWEET_GPU_RBBM_STATUS        0x00210
+-#define SWEET_GPU_RBBM_PERFCTR_GPU_BUSY_MASKED 0x0050b
+-#define SWEET_GPU_CP_INTERRUPT_STATUS 0x00823
+-#define SWEET_GPU_RBBM_INT_0_STATUS  0x00201
+-
+-static volatile uint32_t *g_gpu_regs;
+-static volatile uint32_t *g_gmu_regs;
+-static bool g_probed;
+-
+-static inline uint32_t
+-sweet_gpu_read(uint32_t off)
+-{
+-	return g_gpu_regs ? g_gpu_regs[off] : 0xffffffffu;
+-}
+-
+-extern "C" void
+-sweet_gpu_hw_probe(void)
+-{
+-	if (g_probed) {
+-		return;
+-	}
+-	g_probed = true;
+-
+-	g_gpu_regs = (volatile uint32_t *)ml_io_map(SWEET_GPU_WIN_BASE, SWEET_GPU_WIN_SIZE);
+-	g_gmu_regs = (volatile uint32_t *)ml_io_map(SWEET_GPU_GMU_BASE, SWEET_GPU_GMU_SIZE);
+-	IOLog("SWEET GPU: windows gpu=%p gmu=%p\n", g_gpu_regs, g_gmu_regs);
+-	if (!g_gpu_regs) {
+-		IOLog("SWEET GPU: GPU window map failed\n");
+-		return;
+-	}
+-
+-	uint32_t rbbm = sweet_gpu_read(SWEET_GPU_RBBM_STATUS);
+-	uint32_t cp_irq = sweet_gpu_read(SWEET_GPU_CP_INTERRUPT_STATUS);
+-	uint32_t busy = sweet_gpu_read(SWEET_GPU_RBBM_PERFCTR_GPU_BUSY_MASKED);
+-	IOLog("SWEET GPU: RBBM_STATUS=0x%08x CP_INT=0x%08x BUSY=0x%08x\n",
+-	    rbbm, cp_irq, busy);
+-	/* Power domain status (GPUCC GDSC registers). */
+-	{
+-		volatile uint32_t *gpucc = (volatile uint32_t *)ml_io_map(0x03d90000ULL, 0x000a0000ULL);
+-		if (gpucc) {
+-			uint32_t cx = gpucc[(0x3d9905c - 0x3d90000) / 4];
+-			uint32_t gx = gpucc[(0x3d99108 - 0x3d90000) / 4];
+-			IOLog("SWEET GPU: GDSC CX=0x%08x GX=0x%08x\n", cx, gx);
+-			IOLog("SWEET GPU: GDSC CX on=%d GX on=%d\n", (cx & 1) == 0, (gx & 1) == 0);
+-		} else {
+-			IOLog("SWEET GPU: GPUCC window map failed\n");
+-		}
+-	}
+-	IOLog("SWEET GPU: A725 probe done (stage 1, read-only)\n");
+-}
++/*
++ * SWEET GPU: Adreno 725 driver - stage 1 (MMIO probe only).
++ *
++ * Maps the GPU/GMU register windows from the marble hardware map
++ * (gpu-hw-map.md) and reads identification registers. Nothing is written
++ * to the GPU yet; this is the first step of the A725 bring-up.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <stdint.h>
++
++extern "C" {
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++}
++
++/* Hardware windows (from the marble device tree, see gpu-hw-map.md). */
++#define SWEET_GPU_WIN_BASE   0x03d00000ULL
++#define SWEET_GPU_WIN_SIZE   0x00040000ULL
++#define SWEET_GPU_GMU_BASE   0x03d68000ULL
++#define SWEET_GPU_GMU_SIZE   0x00037000ULL
++#define SWEET_GPU_GMU2_BASE  0x0b290000ULL
++#define SWEET_GPU_GMU2_SIZE  0x00010000ULL
++#define SWEET_GPU_GMU3_BASE  0x03d40000ULL
++#define SWEET_GPU_GMU3_SIZE  0x00010000ULL
++
++/* Register offsets (dword indices), see sweet_gpu_defs.h */
++#define SWEET_GPU_RBBM_STATUS        0x00210
++#define SWEET_GPU_RBBM_PERFCTR_GPU_BUSY_MASKED 0x0050b
++#define SWEET_GPU_CP_INTERRUPT_STATUS 0x00823
++#define SWEET_GPU_RBBM_INT_0_STATUS  0x00201
++
++static volatile uint32_t *g_gpu_regs;
++static volatile uint32_t *g_gmu_regs;
++static bool g_probed;
++
++static inline uint32_t
++sweet_gpu_read(uint32_t off)
++{
++	return g_gpu_regs ? g_gpu_regs[off] : 0xffffffffu;
++}
++
++extern "C" void
++sweet_gpu_hw_probe(void)
++{
++	if (g_probed) {
++		return;
++	}
++	g_probed = true;
++
++	g_gpu_regs = (volatile uint32_t *)ml_io_map(SWEET_GPU_WIN_BASE, SWEET_GPU_WIN_SIZE);
++	g_gmu_regs = (volatile uint32_t *)ml_io_map(SWEET_GPU_GMU_BASE, SWEET_GPU_GMU_SIZE);
++	IOLog("SWEET GPU: windows gpu=%p gmu=%p\n", g_gpu_regs, g_gmu_regs);
++	if (!g_gpu_regs) {
++		IOLog("SWEET GPU: GPU window map failed\n");
++		return;
++	}
++
++	uint32_t rbbm = sweet_gpu_read(SWEET_GPU_RBBM_STATUS);
++	uint32_t cp_irq = sweet_gpu_read(SWEET_GPU_CP_INTERRUPT_STATUS);
++	uint32_t busy = sweet_gpu_read(SWEET_GPU_RBBM_PERFCTR_GPU_BUSY_MASKED);
++	IOLog("SWEET GPU: RBBM_STATUS=0x%08x CP_INT=0x%08x BUSY=0x%08x\n",
++	    rbbm, cp_irq, busy);
++	/* Power domain status (GPUCC GDSC registers). */
++	{
++		volatile uint32_t *gpucc = (volatile uint32_t *)ml_io_map(0x03d90000ULL, 0x000a0000ULL);
++		if (gpucc) {
++			uint32_t cx = gpucc[(0x3d9905c - 0x3d90000) / 4];
++			uint32_t gx = gpucc[(0x3d99108 - 0x3d90000) / 4];
++			IOLog("SWEET GPU: GDSC CX=0x%08x GX=0x%08x\n", cx, gx);
++			IOLog("SWEET GPU: GDSC CX on=%d GX on=%d\n", (cx & 1) == 0, (gx & 1) == 0);
++			/* Stage 2: power on the CX/GX GPU power domains. */
++			if (cx & 1u) {
++				gpucc[(0x3d9905c - 0x3d90000) / 4] = cx & ~1u;
++			}
++			if (gx & 1u) {
++				gpucc[(0x3d99108 - 0x3d90000) / 4] = gx & ~1u;
++			}
++			IODelay(200);
++			uint32_t cx1 = gpucc[(0x3d9905c - 0x3d90000) / 4];
++			uint32_t gx1 = gpucc[(0x3d99108 - 0x3d90000) / 4];
++			IOLog("SWEET GPU: GDSC after power CX=0x%08x GX=0x%08x on=%d/%d\n",
++			    cx1, gx1, (cx1 & 1) == 0, (gx1 & 1) == 0);
++			IOLog("SWEET GPU: RBBM_STATUS after power=0x%08x\n",
++			    sweet_gpu_read(SWEET_GPU_RBBM_STATUS));
++		} else {
++			IOLog("SWEET GPU: GPUCC window map failed\n");
++		}
++	}
++	IOLog("SWEET GPU: A725 probe done (stage 1, read-only)\n");
++}

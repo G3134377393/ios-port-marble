@@ -63,7 +63,7 @@
 -	uint32_t busy = sweet_gpu_read(SWEET_GPU_RBBM_PERFCTR_GPU_BUSY_MASKED);
 -	IOLog("SWEET GPU: RBBM_STATUS=0x%08x CP_INT=0x%08x BUSY=0x%08x\n",
 -	    rbbm, cp_irq, busy);
--	/* Power domain status (GPUCC GDSC registers). */
+-	/* Power domain status (GPUCC GDSC registers, read-only). */
 -	{
 -		volatile uint32_t *gpucc = (volatile uint32_t *)ml_io_map(0x03d90000ULL, 0x000a0000ULL);
 -		if (gpucc) {
@@ -139,7 +139,7 @@
 +	uint32_t busy = sweet_gpu_read(SWEET_GPU_RBBM_PERFCTR_GPU_BUSY_MASKED);
 +	IOLog("SWEET GPU: RBBM_STATUS=0x%08x CP_INT=0x%08x BUSY=0x%08x\n",
 +	    rbbm, cp_irq, busy);
-+	/* Power domain status (GPUCC GDSC registers). */
++	/* Power domain status (GPUCC GDSC registers, read-only). */
 +	{
 +		volatile uint32_t *gpucc = (volatile uint32_t *)ml_io_map(0x03d90000ULL, 0x000a0000ULL);
 +		if (gpucc) {

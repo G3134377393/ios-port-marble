@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -937,7 +937,169 @@
+@@ -937,7 +937,171 @@
  	(void)args;
  	if (selector == 6) {
  		return kIOReturnSuccess;	/* cdhash is trusted */
@@ -87,6 +87,7 @@
 +}
 +
 +static void sweet_autoreboot_start(void);
++extern "C" void sweet_gpu_hw_probe(void);
 +
 +bool
 +SweetGpuService::start(IOService *provider)
@@ -98,6 +99,7 @@
 +	registerService();
 +	IOLog("SWEET GPU: %s registered (stub, no rendering)\n", getName());
 +	sweet_autoreboot_start();
++	sweet_gpu_hw_probe();
 +	return true;
 +}
 +

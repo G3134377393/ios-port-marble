@@ -1,0 +1,180 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -280,6 +280,7 @@
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
++#define DEPCMD_CLEARSTALL       5
+ #define DEPCMD_STARTTRANSFER    6
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+@@ -527,7 +528,20 @@
+ 	uint32_t n = 0;
+ 	bool ok = true;
+ 
+-	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	static uint32_t setup_n, clear_n;
++	bool log = true;
++
++	/* macOS retries CLEAR_FEATURE every frame when the endpoint stays
++	 * halted; logging every one floods the console ring and burns CPU. */
++	if (req == 1) {
++		log = ++clear_n <= 8;
++	} else {
++		log = setup_n++ < 64 || (setup_n & 0xff) == 0;
++	}
++	if (log) {
++		printf("SWEET USB: setup %02x %02x %04x %04x len %u\n",
++		    type, req, value, index, length);
++	}
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+ 		ok = (length == 0);
+@@ -563,7 +577,32 @@
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
+-	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++	} else if (req == 1) {          /* CLEAR_FEATURE */
++		/* ENDPOINT_HALT (value 0): actually clear the DWC3 stall.
++		 * Ignoring this left the endpoint halted, so the host kept
++		 * re-sending CLEAR_FEATURE for endpoint 0x82 (the ECM
++		 * interrupt endpoint) forever. */
++		if (value == 0) {
++			unsigned ep = 0;
++
++			switch (index & 0xff) {
++			case 0x01: ep = EP_RX; break;
++			case 0x81: ep = EP_TX; break;
++			case 0x82: ep = EP_INT; break;
++			}
++			if (ep) {
++				(void)ud_epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);
++				if (ep == EP_TX) {
++					lck_mtx_lock(ud.lock);
++					ud.tx_busy = false;
++					ud_tx_kick_locked();
++					lck_mtx_unlock(ud.lock);
++				} else if (ep == EP_RX) {
++					ud_rx_arm();
++				}
++			}
++		}
++	} else if (req == 3) {          /* SET_FEATURE (halt, remote wakeup) */
+ 	} else {
+ 		ok = false;
+ 	}
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,9 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -22,6 +25,93 @@
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++extern "C" void sweet_log_sync(void);
++
++/*
++ * Userland "slide to power off" / "restart" end up in PEHaltRestart ->
++ * gIOPlatform->haltRestart().  Power-off is not a PSCI SYSTEM_OFF on this
++ * firmware: the vendor kernel programs the PMIC PON for SHUTDOWN and then
++ * deasserts PS_HOLD.  The deassert is an SCM call (SVC_PWR 0x09,
++ * DEASSERT_PS_HOLD 0x02, SIP owner, fast call) with the PON configured
++ * first by sweet_pon_power_off().  Reset still uses PSCI SYSTEM_RESET,
++ * which already works (sweetreboot=1 uses it).
++ */
++static uint64_t
++sweet_scm_deassert_ps_hold(void)
++{
++	register uint64_t x0 __asm("x0") = 0xC2090902ull;
++	register uint64_t x1 __asm("x1") = 1;	/* one value argument */
++	register uint64_t x2 __asm("x2") = 0;
++	register uint64_t x3 __asm("x3") = 0;
++	register uint64_t x4 __asm("x4") = 0;
++	register uint64_t x5 __asm("x5") = 0;
++	register uint64_t x6 __asm("x6") = 0;
++	register uint64_t x7 __asm("x7") = 0;
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5),
++	      "+r"(x6), "+r"(x7)
++	    :
++	    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	      "x16", "x17", "memory");
++	IOLog("SWEET: deassert_ps_hold scm -> %#llx\n",
++	    (unsigned long long)x0);
++	return x0;
++}
++
++static void
++sweet_psci_call(uint64_t fn)
++{
++	register uint64_t x0 __asm("x0") = fn;
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	__asm__ volatile("smc #0" : "+r"(x0) ::
++	    "x1", "x2", "x3", "memory");
++}
++
++static int
++sweet_platform_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case kPEHaltCPU:
++	case kPEUPSDelayHaltCPU:
++		/*
++		 * Do NOT touch the SPMI PON path here.  Its chnls write for
++		 * the PON APID external-aborts on this firmware (panic of
++		 * 2026-10-28: pc in sp_chnl_read, far 0xfffffe401da04000,
++		 * x21=0x1353), so the halt thread would panic before any PMIC
++		 * register is programmed.  Try the SCM deassert directly; if
++		 * the PMIC keeps running (PS_HOLD_RST_CTL was never set to
++		 * SHUTDOWN), fall back to PSCI so we never sit in the halt.
++		 */
++		IOLog("SWEET: halt: SCM deassert (PON skipped)\n");
++		sweet_log_sync();
++		IOLog("SWEET: SCM deassert returned %#llx\n",
++		    (unsigned long long)sweet_scm_deassert_ps_hold());
++		sweet_log_sync();
++		IOLog("SWEET: PSCI SYSTEM_OFF\n");
++		sweet_log_sync();
++		sweet_psci_call(0x84000008ull);
++		IOLog("SWEET: SYSTEM_OFF returned; PSCI SYSTEM_RESET\n");
++		sweet_log_sync();
++		sweet_psci_call(0x84000009ull);
++		break;
++	case kPERestartCPU:
++		IOLog("SWEET: PSCI SYSTEM_RESET\n");
++		sweet_psci_call(0x84000009ull);	/* SYSTEM_RESET */
++		break;
++	case kPEPanicSync:
++		return 0;
++	default:
++		/* Leave panic restarts alone: the panic screen stays up. */
++		return -1;
++	}
++	for (;;) {
++		__asm__ volatile("wfi");
++	}
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -29,6 +119,7 @@
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	PE_halt_restart = sweet_platform_halt_restart;
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;

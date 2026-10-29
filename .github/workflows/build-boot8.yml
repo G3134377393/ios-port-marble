@@ -17,7 +17,7 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu cpio xxd cmake
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu cpio xxd cmake python3-pil
 
       - name: Build lzfse
         run: |
@@ -77,15 +77,40 @@ jobs:
       - name: Build payload and boot image
         run: |
           set -eux
-          CMDS='debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 wdt=-1 marbleusb=1 marble_touch=0 sweettouch=0 sweetfb_noconsole=1 sweetkeys=1 cs_debug=0 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 -no-corpses'
+          CMDS='debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 wdt=-1 sweetusb=2 marbleusb=1 ufslogsecs=1 cs_debug=0 sweetsample=- cs_enforcement_disable=1 unentitled_ios_sim_launch=1 sweetkeys=1 sweettouch=0 marble_touch=1 sweetfb_noconsole=1 sweetiolog=- sweetadsp=1 gicrstride=0x40000 sweetbatt=1 sweetglink=1'
           python3 scripts/mkpayload.py kernel.patched marble.adt payload.bin --cmdline "$CMDS"
           cd shim
+          # The upstream shim embeds a 1080x2400 boot splash (raw BGRA) and the
+          # PCM clip handed to the DSP; shim/build_xnu.sh generates both from
+          # splash.png before compiling (we reproduce it with the distro toolchain).
+          python3 - <<'PY'
+          from PIL import Image
+          im = Image.open('splash.png').convert('RGB')
+          raw = im.tobytes()
+          n = im.width * im.height
+          out = bytearray(n * 4)
+          out[0::4] = raw[2::3]   # B
+          out[1::4] = raw[1::3]   # G
+          out[2::4] = raw[0::3]   # R
+          out[3::4] = b'\xff' * n  # X
+          open('splash.bgra', 'wb').write(out)
+          print('splash.bgra: %dx%d, %d bytes' % (im.width, im.height, n * 4))
+          PY
+          python3 - <<'PY'
+          import math, struct
+          n = 20480  # shim.c PCM_REGION default (0x5000)
+          pcm = bytearray()
+          for i in range(n // 2):
+              pcm += struct.pack('<h', int(6000 * math.sin(2 * math.pi * 1000 * i / 48000)))
+          open('pcm.raw', 'wb').write(pcm[:n])
+          print('pcm.raw: %d bytes' % n)
+          PY
           CC=aarch64-linux-gnu-gcc
           OBJCOPY=aarch64-linux-gnu-objcopy
-          CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DFB_STRIDE=4320"
+          CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -Wno-unused-function -Wno-unused-variable -DFB_STRIDE=4320 -DPCM_REGION=20480 -DGPU_PROBE_LEVEL=0 -DGP_CBAR_BANK=-1 -DGP_CBAR_WRITE=0 -DGP_CBAR_COUNT=0 -DGP_SCTLR_BANK=-1 -DGP_SCTLR_WRITE=0 -DGP_CB_REGS=0 -DGP_GR1_READ=0 -DGP_KGSL_SCAN=0"
           mkdir -p out
-          for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do $CC $CFLAGS -c $f -o out/${f%.*}.o; done
-          $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
+          for f in start.S shim.c console.c mmu.c fdt.c loader.c splash.S pcm.S; do $CC $CFLAGS -c $f -o out/${f%.*}.o; done
+          $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/splash.o out/pcm.o -o out/shim.elf
           $OBJCOPY -O binary out/shim.elf out/Image
           size=$((16#$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')))
           truncate -s "$size" out/Image

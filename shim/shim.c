@@ -143,10 +143,145 @@ static void irq_handler(void)
 	isb();
 }
 
+/*
+ * ---- GPU SMMU / KGSL probe ----
+ *
+ * The GPU has its own SMMU-500 (kgsl-smmu@3da0000) and its own register block
+ * (kgsl-3d0@3d00000); neither is used by XNU yet, so both are exactly as ABL
+ * left them.  The question this answers is whether the non-secure AP can own
+ * that SMMU at all: the audio SID on apps-smmu cannot be taken away from the
+ * hypervisor, but kgsl-smmu is a different instance.
+ *
+ * Runs with the MMU on, before XNU.  Results go to low DRAM at GPU_PROBE_PA
+ * (outside the ADT bank, so XNU never allocates it); bsd/dev/sweet_glink.c
+ * maps that page and prints it into the normal kernel log.
+ *
+ * GPU_PROBE_LEVEL (build knob): 1 = SMMU reads, 2 = +S2CR write test,
+ * 3 = +KGSL RBBM_STATUS read, 4 = both extras.
+ */
+#define GPU_PROBE_PA		0xa2e0f000UL
+#define GPU_PROBE_MAGIC		0x47505550U	/* "GPUP" */
+#define GPU_SMMU_BASE		0x3da0000UL
+#define GPU_KGSL_BASE		0x3d00000UL
+#ifndef GPU_PROBE_LEVEL
+#define GPU_PROBE_LEVEL		1
+#endif
+/* Optional register matrix; every one is a separate build. */
+#ifndef GP_CBAR_BANK
+#define GP_CBAR_BANK		-1	/* -1 = skip */
+#endif
+#ifndef GP_CBAR_WRITE
+#define GP_CBAR_WRITE		0	/* 1 = write 0, 2 = write 0x10000 */
+#endif
+#ifndef GP_CBAR_COUNT
+#define GP_CBAR_COUNT		0	/* read CBAR(0..n-1) */
+#endif
+#ifndef GP_SCTLR_BANK
+#define GP_SCTLR_BANK		-1
+#endif
+#ifndef GP_SCTLR_WRITE
+#define GP_SCTLR_WRITE		0
+#endif
+#ifndef GP_CB_REGS
+#define GP_CB_REGS		0	/* read CB0 TTBR0/TCR/MAIR */
+#endif
+#ifndef GP_GR1_READ
+#define GP_GR1_READ		0	/* read CBA2R/CBFRSYNRA */
+#endif
+#ifndef GP_KGSL_SCAN
+#define GP_KGSL_SCAN		0	/* read four KGSL offsets */
+#endif
+#define GP_STR2(x) #x
+#define GP_STR(x) GP_STR2(x)
+static const char gp_level_tag[] __attribute__((used)) =
+    "gpuprobe-" GP_STR(GPU_PROBE_LEVEL)
+    "-c" GP_STR(GP_CBAR_BANK) "w" GP_STR(GP_CBAR_WRITE)
+    "-s" GP_STR(GP_SCTLR_BANK) "w" GP_STR(GP_SCTLR_WRITE)
+    "-r" GP_STR(GP_CB_REGS) GP_STR(GP_GR1_READ) GP_STR(GP_KGSL_SCAN);
+
+/* Keep this layout identical to the copy in bsd/dev/sweet_glink.c. */
+struct gpu_probe_result {
+	uint32_t magic;		/* 0x00 */
+	uint32_t version;	/* 0x04 */
+	uint32_t scr0;		/* 0x08 */
+	uint32_t id0;		/* 0x0c */
+	uint32_t id1;		/* 0x10 */
+	uint32_t id2;		/* 0x14 */
+	uint32_t num_smr;	/* 0x18 */
+	uint32_t num_cb;	/* 0x1c */
+	uint32_t valid_seen;	/* 0x20 */
+	uint32_t sid0_slot;	/* 0x24 */
+	uint32_t smr0;		/* 0x28 */
+	uint32_t s2cr0;		/* 0x2c */
+	uint32_t wsid;		/* 0x30 */
+	uint32_t w2cr_old;	/* 0x34 */
+	uint32_t wsmr;		/* 0x38 */
+	uint32_t w2cr;		/* 0x3c */
+	uint32_t w2cr_f;	/* 0x40 */
+	uint32_t w2cr_r;	/* 0x44 */
+	uint32_t rfault;	/* 0x48 */
+	uint32_t wfault;	/* 0x4c */
+	uint32_t kgsl_status;	/* 0x50 */
+	uint32_t kgsl_status2;	/* 0x54 */
+	uint32_t kfault;	/* 0x58 */
+	uint32_t pad;		/* 0x5c */
+	uint64_t far;		/* 0x60 */
+	uint64_t esr;		/* 0x68 */
+	uint32_t w2cr_t;	/* 0x70 readback after S2CR = TRANS|CB0 */
+	uint32_t wcbar_old;	/* 0x74 CBAR(0) before */
+	uint32_t wcbar;		/* 0x78 CBAR(0) after writing 0 */
+	uint32_t wsctlr_old;	/* 0x7c CB0.SCTLR before */
+	uint32_t wsctlr;	/* 0x80 CB0.SCTLR after writing 0 */
+	uint32_t op_fault;	/* 0x84 bitmask for the optional matrix */
+	uint64_t pad3;		/* 0x88 */
+	uint32_t cbar_bank;	/* 0x90 bank selected by GP_CBAR_BANK */
+	uint32_t cbar_r;	/* 0x94 */
+	uint32_t cbar_w;	/* 0x98 readback after the write */
+	uint32_t sctlr_bank;	/* 0x9c */
+	uint32_t sctlr_r;	/* 0xa0 */
+	uint32_t sctlr_w;	/* 0xa4 */
+	uint32_t ttbr0;		/* 0xa8 CB0+0x20 */
+	uint32_t tcr;		/* 0xac CB0+0x30 */
+	uint32_t mair;		/* 0xb0 CB0+0x38 */
+	uint32_t cba2r;		/* 0xb4 GR1+0x800 */
+	uint32_t cbfrsynra;	/* 0xb8 GR1+0x400 */
+	uint32_t cbar_count;	/* 0xbc */
+	uint32_t cbar1;		/* 0xc0 */
+	uint32_t cbar2;		/* 0xc4 */
+	uint32_t cbar3;		/* 0xc8 */
+	uint32_t last_step;	/* 0xcc written before every risky access */
+	uint32_t prev_step;	/* 0xd0 last_step found at entry */
+	uint32_t prev_magic;	/* 0xd4 */
+	uint32_t kg0;		/* 0xd8 */
+	uint32_t kg1;		/* 0xdc */
+	uint32_t kg2;		/* 0xe0 */
+	uint32_t kg3;		/* 0xe4 */
+	uint32_t pad4;		/* 0xe8 */
+	uint64_t pad5;		/* 0xf0 */
+};				/* 0xf8 */
+
+static volatile int gp_busy;
+static volatile int gp_fault;
+static volatile uint64_t gp_esr, gp_far;
+
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
 	if (slot == 5) {	/* IRQ from current EL, SPx */
 		irq_handler();
+		return;
+	}
+	/*
+	 * The GPU probe reads blocks that may be powered down.  A synchronous
+	 * data abort there is an answer, not a panic: record ESR/FAR, skip the
+	 * load/store, and let the probe carry on with the next register.
+	 */
+	if (gp_busy && (slot & 3) == 0 &&
+	    ((rsr("esr_el1") >> 26) & 0x3f) == 0x25) {
+		gp_fault = 1;
+		gp_esr = rsr("esr_el1");
+		gp_far = rsr("far_el1");
+		wsr("elr_el1", rsr("elr_el1") + 4);
+		isb();
 		return;
 	}
 	con_clear(BLUE);
@@ -166,6 +301,313 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("X1", regs[1]);
 	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
 	reset(40);
+}
+
+/* Probe-safe MMIO: the fault flag makes the caller ignore the value. */
+static uint32_t
+gp_rd32(uintptr_t a)
+{
+	uint32_t v = 0;
+
+	gp_fault = 0;
+	gp_busy = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	v = rd32(a);
+	__asm__ volatile("dsb sy" ::: "memory");
+	gp_busy = 0;
+	if (gp_fault)
+		return 0xffffffffu;
+	return v;
+}
+
+static void
+gp_wr32(uintptr_t a, uint32_t v)
+{
+	gp_fault = 0;
+	gp_busy = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(a, v);
+	__asm__ volatile("dsb sy" ::: "memory");
+	gp_busy = 0;
+}
+
+static void
+gpu_probe_boot(void)
+{
+	volatile struct gpu_probe_result *r =
+	    (volatile struct gpu_probe_result *)GPU_PROBE_PA;
+	uintptr_t s = GPU_SMMU_BASE;
+	uint32_t id0, id1, num_smr, num_cb, smr, s2cr;
+	uint32_t rf = 0, wf = 0;
+	uint32_t prev_magic = r->magic, prev_step = r->last_step;
+	int slot0 = -1, free_slot = -1;
+	unsigned i;
+
+	for (i = 0; i < sizeof(*r); i++)
+		((volatile uint8_t *)r)[i] = 0;
+	r->prev_magic = prev_magic;
+	r->prev_step = prev_step;
+	r->version = GPU_PROBE_LEVEL;
+	r->sid0_slot = 0xffffffffu;
+	r->wsid = 0xffffffffu;
+	r->cbar_bank = 0xffffffffu;
+	r->sctlr_bank = 0xffffffffu;
+
+	/* gp_fault is cleared by every access, so latch it after each one. */
+	r->scr0 = gp_rd32(s + 0x00);
+	if (gp_fault && !rf) {
+		rf = 1;
+		r->far = gp_far;
+		r->esr = gp_esr;
+	}
+	r->id0 = gp_rd32(s + 0x20);
+	if (gp_fault && !rf) {
+		rf = 1;
+		r->far = gp_far;
+		r->esr = gp_esr;
+	}
+	r->id1 = gp_rd32(s + 0x24);
+	if (gp_fault && !rf) {
+		rf = 1;
+		r->far = gp_far;
+		r->esr = gp_esr;
+	}
+	r->id2 = gp_rd32(s + 0x28);
+	if (gp_fault && !rf) {
+		rf = 1;
+		r->far = gp_far;
+		r->esr = gp_esr;
+	}
+	r->rfault = rf;
+	con_hex2("GPU", "id0=", r->id0, "id1=", r->id1);
+	con_hex2("GPU", "scr=", r->scr0, "rflt=", r->rfault);
+	if (rf)
+		goto done;
+
+	id0 = r->id0;
+	id1 = r->id1;
+	num_smr = id0 & 0xffu;		/* IDR0[7:0]  NUMSMRG   */
+	num_cb = id1 & 0xffu;		/* IDR1[7:0]  NUMCB     */
+	if (num_smr > 32)
+		num_smr = 32;
+	r->num_smr = num_smr;
+	r->num_cb = num_cb;
+	r->rfault = 0;
+	r->far = 0;
+	r->esr = 0;
+
+	/* SMR/S2CR are at the same offsets on every SMMU-500 instance. */
+	for (i = 0; i < num_smr; i++) {
+		smr = gp_rd32(s + 0x800 + 4 * i);
+		if (gp_fault)
+			goto readfault;
+		s2cr = gp_rd32(s + 0xc00 + 4 * i);
+		if (gp_fault)
+			goto readfault;
+		if (!(smr & 0x80000000u)) {
+			if (free_slot < 0)
+				free_slot = (int)i;
+			continue;
+		}
+		r->valid_seen++;
+		if (((smr >> 16) & 0x7fffu) == 0 && slot0 < 0) {
+			slot0 = (int)i;
+			r->sid0_slot = (uint32_t)i;
+			r->smr0 = smr;
+			r->s2cr0 = s2cr;
+		}
+	}
+
+	if (GPU_PROBE_LEVEL >= 2) {
+		int w = (slot0 >= 0) ? slot0 : free_slot;
+
+		if (w >= 0) {
+			uint32_t old = gp_rd32(s + 0xc00 + 4 * w);
+
+			r->wsid = (uint32_t)w;
+			r->w2cr_old = old;
+			wf |= (uint32_t)gp_fault;
+			if (gp_fault)		/* cannot own what we cannot read */
+				goto wdone;
+			if (slot0 < 0) {
+				gp_wr32(s + 0x800 + 4 * w, 0x80000000u);
+				wf |= (uint32_t)gp_fault;
+				r->wsmr = gp_rd32(s + 0x800 + 4 * w);
+				wf |= (uint32_t)gp_fault;
+			}
+			gp_wr32(s + 0xc00 + 4 * w, 0x00010000u);	/* BYPASS */
+			wf |= (uint32_t)gp_fault;
+			r->w2cr = gp_rd32(s + 0xc00 + 4 * w);
+			wf |= (uint32_t)gp_fault;
+			gp_wr32(s + 0xc00 + 4 * w, 0x00020000u);	/* FAULT */
+			wf |= (uint32_t)gp_fault;
+			r->w2cr_f = gp_rd32(s + 0xc00 + 4 * w);
+			wf |= (uint32_t)gp_fault;
+			gp_wr32(s + 0xc00 + 4 * w, old);		/* restore */
+			wf |= (uint32_t)gp_fault;
+			r->w2cr_r = gp_rd32(s + 0xc00 + 4 * w);
+			wf |= (uint32_t)gp_fault;
+
+			/*
+			 * Level 5: bypass is refused, but the GPU does not use
+			 * bypass - it uses stage-1 translation.  Does a TRANS
+			 * S2CR stick?  Only this one register: CBAR/SCTLR are
+			 * a separate question and an SError there would take
+			 * the whole boot with it.
+			 */
+			if (GPU_PROBE_LEVEL >= 5 && !wf) {
+				gp_wr32(s + 0xc00 + 4 * w, 0x00000001u);  /* TRANS, CB0 */
+				wf |= (uint32_t)gp_fault;
+				r->w2cr_t = gp_rd32(s + 0xc00 + 4 * w);
+				wf |= (uint32_t)gp_fault;
+				gp_wr32(s + 0xc00 + 4 * w, old);	  /* restore */
+				wf |= (uint32_t)gp_fault;
+			}
+			if (slot0 < 0) {
+				/* Remove the SMR entry this probe created. */
+				gp_wr32(s + 0x800 + 4 * w, 0);
+				wf |= (uint32_t)gp_fault;
+			}
+wdone:
+			r->wfault = wf;
+		}
+	}
+
+	/*
+	 * Optional register matrix.  Each block is a separate build so one
+	 * fatal access does not hide the answer to the others.  last_step is
+	 * written before every access, so a boot that dies leaves the step in
+	 * DRAM for the next variant to report as prev_step (if DRAM survives).
+	 */
+	r->op_fault = 0;
+
+#if GP_KGSL_SCAN
+	r->last_step = 20;
+	r->kg0 = gp_rd32(GPU_KGSL_BASE + 0x0000u);
+	if (gp_fault)
+		r->op_fault |= 1u;
+	r->last_step = 21;
+	r->kg1 = gp_rd32(GPU_KGSL_BASE + 0x0840u);	/* RBBM_STATUS */
+	if (gp_fault)
+		r->op_fault |= 2u;
+	r->last_step = 22;
+	r->kg2 = gp_rd32(GPU_KGSL_BASE + 0x1000u);
+	if (gp_fault)
+		r->op_fault |= 4u;
+	r->last_step = 23;
+	r->kg3 = gp_rd32(GPU_KGSL_BASE + 0x2000u);
+	if (gp_fault)
+		r->op_fault |= 8u;
+#endif
+
+#if GP_GR1_READ
+	r->last_step = 30;
+	r->cba2r = gp_rd32(s + 0x1800u);		/* GR1+0x800 */
+	if (gp_fault)
+		r->op_fault |= 0x10u;
+	r->last_step = 31;
+	r->cbfrsynra = gp_rd32(s + 0x1400u);		/* GR1+0x400 */
+	if (gp_fault)
+		r->op_fault |= 0x20u;
+#endif
+
+#if GP_CBAR_COUNT > 0
+	r->last_step = 40;
+	r->cbar_count = GP_CBAR_COUNT;
+	r->cbar_r = gp_rd32(s + 0x1000u);
+	if (gp_fault)
+		r->op_fault |= 0x40u;
+#if GP_CBAR_COUNT > 1
+	r->last_step = 41;
+	r->cbar1 = gp_rd32(s + 0x1004u);
+	if (gp_fault)
+		r->op_fault |= 0x40u;
+#endif
+#if GP_CBAR_COUNT > 2
+	r->last_step = 42;
+	r->cbar2 = gp_rd32(s + 0x1008u);
+	if (gp_fault)
+		r->op_fault |= 0x40u;
+#endif
+#if GP_CBAR_COUNT > 3
+	r->last_step = 43;
+	r->cbar3 = gp_rd32(s + 0x100cu);
+	if (gp_fault)
+		r->op_fault |= 0x40u;
+#endif
+#endif
+
+#if GP_CBAR_BANK >= 0
+	r->cbar_bank = GP_CBAR_BANK;
+	r->last_step = 50;
+	r->cbar_r = gp_rd32(s + 0x1000u + 4u * GP_CBAR_BANK);
+	if (gp_fault)
+		r->op_fault |= 0x80u;
+#if GP_CBAR_WRITE
+	r->last_step = 51;
+	gp_wr32(s + 0x1000u + 4u * GP_CBAR_BANK,
+	    (GP_CBAR_WRITE == 1) ? 0u : 0x10000u);
+	if (gp_fault)
+		r->op_fault |= 0x100u;
+	r->last_step = 52;
+	r->cbar_w = gp_rd32(s + 0x1000u + 4u * GP_CBAR_BANK);
+	if (gp_fault)
+		r->op_fault |= 0x200u;
+#endif
+#endif
+
+#if GP_SCTLR_BANK >= 0
+	r->sctlr_bank = GP_SCTLR_BANK;
+	r->last_step = 60;
+	r->sctlr_r = gp_rd32(s + 0x80000u + 0x1000u * GP_SCTLR_BANK);
+	if (gp_fault)
+		r->op_fault |= 0x400u;
+#if GP_SCTLR_WRITE
+	r->last_step = 61;
+	gp_wr32(s + 0x80000u + 0x1000u * GP_SCTLR_BANK, 0u);
+	if (gp_fault)
+		r->op_fault |= 0x800u;
+	r->last_step = 62;
+	r->sctlr_w = gp_rd32(s + 0x80000u + 0x1000u * GP_SCTLR_BANK);
+	if (gp_fault)
+		r->op_fault |= 0x1000u;
+#endif
+#endif
+
+#if GP_CB_REGS
+	r->last_step = 70;
+	r->ttbr0 = gp_rd32(s + 0x80020u);
+	if (gp_fault)
+		r->op_fault |= 0x2000u;
+	r->last_step = 71;
+	r->tcr = gp_rd32(s + 0x80030u);
+	if (gp_fault)
+		r->op_fault |= 0x4000u;
+	r->last_step = 72;
+	r->mair = gp_rd32(s + 0x80038u);
+	if (gp_fault)
+		r->op_fault |= 0x8000u;
+#endif
+
+	if (GPU_PROBE_LEVEL >= 3) {
+		/* kgsl register offsets are in dwords: RBBM_STATUS = 0x210. */
+		r->kgsl_status = gp_rd32(GPU_KGSL_BASE + 0x840);
+		r->kfault = (uint32_t)gp_fault;
+		if (!gp_fault)
+			r->kgsl_status2 = gp_rd32(GPU_KGSL_BASE + 0x804);
+		if (gp_fault)
+			r->kfault = 1;
+	}
+	goto done;
+
+readfault:
+	r->rfault = 1;
+	r->far = gp_far;
+	r->esr = gp_esr;
+done:
+	__asm__ volatile("dsb sy" ::: "memory");
+	r->magic = GPU_PROBE_MAGIC;	/* publish last */
+	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 /* ---- SMP ---- */
@@ -567,12 +1009,84 @@ static void __attribute__((unused)) shim_main_p1(uint64_t dtb)
 
 /* ---- X1: load the SWEETXNU payload and jump to xnu ---- */
 
+extern const uint32_t splash_img[];
+
+/*
+ * XNU's phystokv_range() (arm_vm_init.c) refuses every PA outside the ADT
+ * bank (0x840000000+), so ml_io_map() cannot touch low DRAM.  The DSP, on
+ * the other hand, is behind apps-smmu SID 0x1801 which we leave bypassing,
+ * so it reads plain physical addresses fine.  Fill the PCM tone here, while
+ * the shim has no MMU (plain physical stores), and let sweet_glink.c map
+ * exactly TONE_PA with offset mode and stream offsets 0/0x800.
+ * Two 1152-byte buffers, 144 frames of 32-bit stereo at 96 kHz.
+ */
+#define TONE_PA		0xa2e00000UL
+/* Bytes copied in front of the DSP: the kernel declares the same size as the
+ * shared-memory region, so the offsets it streams are all inside this. */
+#ifndef PCM_REGION
+#define PCM_REGION	0x5000UL	/* overridden by build_xnu.sh (-DPCM_REGION) */
+#endif
+
+extern const uint8_t pcm_img[];
+extern const uint8_t pcm_img_end[];
+
+/* Copy the embedded raw PCM (48 kHz / 24-bit LE / stereo) into low DRAM,
+ * looping if the clip is shorter than the region.  Falls back to the built-in
+ * sine only if the image carries no PCM at all. */
+static void
+fill_pcm_low(void)
+{
+	const uint8_t *src = pcm_img;
+	uint32_t n = (uint32_t)(pcm_img_end - pcm_img);
+	volatile uint8_t *p = (volatile uint8_t *)TONE_PA;
+
+	if (n == 0) {
+		return;
+	}
+	for (uint32_t i = 0; i < PCM_REGION; i++) {
+		p[i] = src[i % n];
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+static const int16_t tone48[48] = {
+	0, 1069, 2120, 3135, 4096, 4987, 5793, 6499,
+	7094, 7568, 7913, 8122, 8192, 8122, 7913, 7568,
+	7094, 6499, 5793, 4987, 4096, 3135, 2120, 1069,
+	0, -1069, -2120, -3135, -4096, -4987, -5793, -6499,
+	-7094, -7568, -7913, -8122, -8192, -8122, -7913, -7568,
+	-7094, -6499, -5793, -4987, -4096, -3135, -2120, -1069,
+};
+
+static void
+fill_tone_low(void)
+{
+	volatile uint32_t *p = (volatile uint32_t *)TONE_PA;
+
+	for (int b = 0; b < 2; b++) {
+		for (int i = 0; i < 144; i++) {
+			int32_t v = (int32_t)tone48[i % 48] << 16;
+
+			p[b * 0x200 + 2 * i] = (uint32_t)v;
+			p[b * 0x200 + 2 * i + 1] = (uint32_t)v;
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 #ifndef UFS_DIAG
 void shim_main(uint64_t dtb)
 {
 	stage = "xnu";
-	con_clear(RED);
+	con_image(splash_img, FB_W, FB_H);
 	con_str("SHIM", "marble XNU loader");
+	if ((uint32_t)(pcm_img_end - pcm_img) != 0) {
+		fill_pcm_low();
+		con_hex2("PCM", "bytes=", (uint32_t)(pcm_img_end - pcm_img),
+		    " at=", (uint32_t)TONE_PA);
+	} else {
+		fill_tone_low();
+		con_str("TONE", "prefilled at 0xa2e00000");
+	}
 
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
@@ -583,6 +1097,10 @@ void shim_main(uint64_t dtb)
 		reset(20);
 	}
 	con_skip();
+
+#if GPU_PROBE_LEVEL > 0
+	gpu_probe_boot();
+#endif
 
 	/* loader_boot never returns on success; on failure it returns a reason. */
 	const char *why = loader_boot(dtb);

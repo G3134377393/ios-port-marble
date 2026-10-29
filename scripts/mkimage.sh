@@ -33,8 +33,28 @@ PY
 
 # ufsroot_* describe the HFS+ root image that lives in this phone's userdata
 # partition.  Change them if your partition layout differs.
-CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata ufsroot_lba=0x3603600 ufsroot_blocks=5243387 ufsrw=1 rootrw=1 wdt=-1 sweetusb=2 marbleusb=1 ufslogsecs=1 cs_debug=0 sweetsample=- cs_enforcement_disable=1 unentitled_ios_sim_launch=1 sweetkeys=1 sweettouch=0 marble_touch=1 sweetfb_noconsole=1 sweetiolog=- sweetadsp=1 sweetglink=1'
+CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata ufsroot_lba=0x3603600 ufsroot_blocks=5243387 ufsrw=1 rootrw=1 wdt=-1 sweetusb=2 marbleusb=1 ufslogsecs=1 cs_debug=0 sweetsample=- cs_enforcement_disable=1 unentitled_ios_sim_launch=1 sweetkeys=1 sweettouch=0 marble_touch=1 sweetfb_noconsole=1 sweetiolog=- sweetadsp=1 gicrstride=0x40000 sweetbatt=1 sweetglink=1 sweetreboot=1'
 for a in "$@"; do CMDLINE="$CMDLINE $a"; done
+# KEEPALIVE=1 builds an image that stays in iOS instead of resetting itself
+# after boot.  Use it when a human needs to touch the GUI (e.g. to feel the
+# haptics); log collection needs the default reset behaviour.
+if [ "${KEEPALIVE:-0}" = 1 ]; then
+  CMDLINE=$(printf '%s' "$CMDLINE" | sed 's/ *sweetreboot=1//')
+fi
+# CPUS=n replaces the single-core default; interactive testing needs the
+# other cores available or every GPIO-bitbang or I2C scan stalls the UI.
+if [ -n "${CPUS:-}" ]; then
+  CMDLINE=$(printf '%s' "$CMDLINE" | sed "s/cpus=[0-9]*/cpus=$CPUS/")
+fi
+# QUIET=1 turns kernel debug output and the persistent SWEETLOG ring off
+# (debug=0 + sweetlog=0).  The ring costs disk I/O; skip it on keepalive
+# images where no log collection is planned.
+if [ "${QUIET:-0}" = 1 ]; then
+  CMDLINE=$(printf '%s' "$CMDLINE" | sed 's/debug=0xc/debug=0/')
+  CMDLINE="$CMDLINE sweetlog=0"
+fi
+# Host wall clock at image build time; XNU sets its calendar from this.
+CMDLINE="$CMDLINE sweettime=$(date +%s)"
 
 mkdir -p "$OUT"
 

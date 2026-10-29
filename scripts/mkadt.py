@@ -66,6 +66,27 @@ def d22ap_product(path=D22AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+
+def d22ap_product_child(name, path=D22AP_ADT):
+    """/product/<name> properties from the real D22AP tree.
+
+    MobileGestalt answers the (obfuscated) haptics capability keys from
+    IODeviceTree:/product/haptics: 'closed-loop' and
+    'supports-3rd-party-haptics' are the values it reads.  d22ap_product()
+    only copies /product's own properties, so without this node every
+    haptics capability reads false and iOS hides the Vibration UI and
+    refuses to play haptics at all."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for pc in c.children:
+                if pc.name == name:
+                    return [(k, v) for k, f, v in pc.props
+                            if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -130,13 +151,25 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # MARBLE SMP: four Cortex-A510 at MPIDR 0x000-0x300 (one homogeneous
-    # cluster, all 16K-capable). The shim runs on CPU0 (MIDR 0x410FD463);
-    # X1 boots with cpus=1. The A710/X2 clusters are added once the early
-    # console works. Keep qcom,kryo470: the SweetCPU IONameMatch (0018) uses it.
+    # MARBLE SMP: all eight cores. MPIDRs come straight from the stock DTB
+    # (cpu@0..cpu@700): four A510 at 0x000-0x300, three A710 at 0x400-0x600,
+    # one X2 at 0x700.  SWEET builds with MAX_CPU_CLUSTERS=1, so every core
+    # stays CLUSTER_TYPE_SMP (cluster-id 0); set cluster to 'E'/'P' only
+    # together with a MAX_CPU_CLUSTERS=2 patch.  clock-frequency is the real
+    # per-core max, which the scheduler uses as a capacity hint even in SMP.
+    # Keep qcom,kryo470: the SweetCPU IONameMatch (0018) uses it.
     # QEMU retains its original single-CPU tree.
+    if qemu:
+        cpu_table = [(0, 1804800000)]  # (MPIDR, max kHz * 1000)
+    else:
+        cpu_table = [
+            (0x000, 1804800000), (0x100, 1804800000),
+            (0x200, 1804800000), (0x300, 1804800000),
+            (0x400, 2496000000), (0x500, 2496000000),
+            (0x600, 2496000000), (0x700, 2918400000),
+        ]
     cpu_nodes = []
-    for core, mpidr in enumerate([0] if qemu else [0x0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700]):
+    for core, (mpidr, clk) in enumerate(cpu_table):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
@@ -144,14 +177,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ('reg', u32(mpidr)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('cluster-type', u32(0)),  # CLUSTER_TYPE_SMP (MAX_CPU_CLUSTERS=1)
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(0)),  # A510 L2
+            ('l2-cache-id', u32(0)),
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(1804800000)),  # A510 max
+            ('clock-frequency', u32(clk)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(3200000000)),  # LPDDR5, descriptive
             ('peripheral-frequency', u32(timebase)),
@@ -237,12 +270,25 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # ('w30r', 'b3a8') that this kernel does not provide: Safari pages stay blank.
     if product_props:
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # /product/haptics: MobileGestalt's only haptics capability source.  Only
+    # the haptics child is copied; camera/facetime would describe hardware we
+    # do not have (and mediaserverd would try to use it).
+    product_children = []
+    haptic_props = d22ap_product_child('haptics')
+    if haptic_props is not None:
+        product_children.append(node('haptics', [ph()] + haptic_props))
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
+    # IOPlatformExpert publishes IOPlatformSerialNumber from these two
+    # strings; iOS reads them for "About this iPhone".  Do NOT put a real
+    # iPhone's serial in the repo: override at build time with
+    # D22AP_SERIAL=... D22AP_MLB=... and keep it out of git.
+    serial = os.environ.get('D22AP_SERIAL', 'F17WD3N5JCL7')
+    mlb = os.environ.get('D22AP_MLB', 'C07W9K3M5P8T')
     return node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,marble') + cstr('xiaomi,sweet') + cstr('qcom,sm7475') + cstr('AppleARM')),
@@ -250,6 +296,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
+        ('serial-number', cstr(serial)),
+        ('mlb-serial-number', cstr(mlb)),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))

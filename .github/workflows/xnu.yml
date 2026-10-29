@@ -47,7 +47,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -105,8 +105,81 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
           ccache -z
-          bash build.sh
+          set -o pipefail
+          # tee so a failed build still leaves the compiler diagnostics behind
+          bash build.sh 2>&1 | tee /tmp/build.log
           ccache -s
+
+      # dxb applies patches with a warning-and-continue policy, so a patch
+      # that no longer applies still produces a green build with the change
+      # silently missing.  Failing here costs one CI run; not failing it
+      # ships a kernel that silently lacks the change being tested.
+      - name: Verify our patches applied
+        run: |
+          # dxb copies xnu/patches into dxb/patches and applies from there,
+          # so the skip line names the COPY, not xnu/patches.  Match by
+          # basename against our series instead.  0172 is an obsolete
+          # experiment superseded by the later glink patches and is allowed
+          # to skip.
+          skipped=$(grep -oE 'Skipping patch [^ ]+' /tmp/build.log \
+            | sed 's|.*/||' || true)
+          bad=""
+          for b in $skipped; do
+            if [ -f "xnu/patches/$b" ] && [ "$b" != "0172-sweet-shm-plain-physical.patch" ]; then
+              bad="$bad $b"
+            fi
+          done
+          if [ -n "$bad" ]; then
+            echo "skipped:$bad"
+            echo "::error::a repository patch was skipped"
+            exit 1
+          fi
+          echo "all patch-series entries applied"
+
+          # A patch can also "apply" while a later edit reverts it.  Check
+          # the built kernel for one marker per recent patch that must be
+          # linked in.
+          K="dxb/fakeroot/System/Library/Kernels/kernel.development.sweet"
+          for s in "SWEET: halt: SCM deassert" \
+                   "SWEET: skip PM halt/restart notifications" \
+                   "SWEET BATT: immediate re-check" \
+                   "SWEET BATT: tick %d ok=" \
+                   "SWEET CACHE: %s patched %s" \
+                   "haptics capability (closed loop)" \
+                   "MG closed-loop key" \
+                   "SWEET MG: cache removed" \
+                   "SWEET HAPTICS: AppleHapticsSupportCallan" \
+                   "SWEET HAPTICS: AppleSPUHaptics"; do
+            if ! LC_ALL=C grep -aq "$s" "$K"; then
+              echo "::error::missing kernel marker: $s (patch skipped?)"
+              exit 1
+            fi
+          done
+          echo "expected markers present"
+
+      # The job log needs admin rights to download, so publish the actual
+      # compiler diagnostics as a release asset instead - that is readable.
+      - name: Publish build errors
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "commit: ${{ github.sha }}"
+            echo
+            echo "=== errors ==="
+            grep -nE 'error:|fatal error|undefined|undeclared|expected' /tmp/build.log \
+              | grep -viE 'unifdef|--- ERROR ---' | head -80 || true
+            echo
+            echo "=== tail ==="
+            tail -60 /tmp/build.log || true
+          } > build-error.txt
+          wc -l build-error.txt
+          gh release upload kernel-latest build-error.txt --clobber \
+            --repo "${{ github.repository }}" \
+            || gh release create kernel-latest build-error.txt \
+                 --title "kernel" --notes "build diagnostics" \
+                 --repo "${{ github.repository }}" || true
 
       - name: Package build tree for local compiles
         if: always()

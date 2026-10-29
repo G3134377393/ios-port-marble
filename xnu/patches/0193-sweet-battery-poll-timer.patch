@@ -1,0 +1,61 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,7 +1,9 @@
+ /*
+  * Built-in iOS battery bring-up service. Default: 100%, no AC reported.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
++ * sweetbattery=1: read-only PM6150 polling every 3 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * sweetbatt=1 also starts the timer: without it the pmic_glink samples are
++ * read once at boot and iOS keeps that fallback value forever.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -214,8 +216,11 @@
+ 
+ 	/* Prefer the value read from the ADSP's battmgr service. */
+ 	if (sweet_batt_get(&bPercent, &bMv, &bMa, &bStatus, &bUsb)) {
+-		bool ext = bUsb != 0;
+-		bool charging = bStatus == 1;
++		/* The battmgr USB flag latches at boot and stays 1 after the
++		 * cable is pulled, while the current follows reality
++		 * (negative = charging).  Use the current alone. */
++		bool ext = bMa < 0;
++		bool charging = ext && bStatus == 1;
+ 		bool full = bStatus == 4;
+ 
+ 		if (bPercent > 100) {
+@@ -277,7 +282,7 @@
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(3000);
+ 	}
+ }
+ 
+@@ -287,18 +292,21 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 0, pmic = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	(void)PE_parse_boot_argn("sweetbatt", &pmic, sizeof(pmic));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	/* pmic_glink (sweetbatt=1) caches samples in sweet_glink.c; poll()
++	 * prefers them, but it is only re-run by this timer. */
++	if (fReal || pmic == 1) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(3000);
+ 		} else {
+ 			fReal = false;
+ 			poll();

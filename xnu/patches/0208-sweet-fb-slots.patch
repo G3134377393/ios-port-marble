@@ -1,0 +1,140 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c53a2e1..2a10c29 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -902,9 +902,16 @@ sweet_log_start(void)
+  * driver's own mapping, see SweetFramebuffer.cpp) and write it to userdata
+  * in front of the persistent console log ring, so a recovery can dd it out.
+  *
+- * Layout, starting at block (partition end - log ring - 2533):
++ * The dumps live in a ring of sweetfbdumpslots slots (default 16, at most
++ * 4096), each 2533 blocks, ending just before the console log ring.  A
++ * global sequence number increases with every dump and the slot used is
++ * seq % slots, so a long run keeps the last "slots" frames.
++ *
++ * Each slot:
+  *   block 0            header: "SWEETFB0" | u32 version 1 | u32 width
+  *                      | u32 height | u32 stride | u64 seq | u64 dumps
++ *                      | u64 panel phys | u64 presents | u64 copies
++ *                      | u32 slots | u32 slot
+  *   blocks 1..2532     raw a8r8g8b8 pixels, stride x height bytes
+  *
+  * Off unless boot-arg sweetfbdump=N (>0, clamped to at least 2 s).
+@@ -913,7 +920,9 @@ sweet_log_start(void)
+ #define SWEET_FB_HEIGHT         2400u
+ #define SWEET_FB_STRIDE         4320u
+ #define SWEET_FB_FRAME_SIZE     (SWEET_FB_STRIDE * SWEET_FB_HEIGHT)     /* 10,368,000 */
+-#define SWEET_FB_BLOCKS         2533u
++#define SWEET_FB_SLOT_BLOCKS    2533u   /* one header block + the frame blocks */
++#define SWEET_FB_SLOTS_DEF      16u
++#define SWEET_FB_SLOTS_MAX      4096u
+ #define SWEET_FB_WARMUP_SECS    10u
+ #define SWEET_FB_MIN_SECS       2u
+ 
+@@ -926,16 +935,21 @@ struct sweet_fb_header {
+ 	uint64_t panel_phys;
+ 	uint64_t present_calls;
+ 	uint64_t layer_copies;
++	uint32_t slots;
++	uint32_t slot;
+ };
+ 
+ static char sweet_fb_copy[SWEET_FB_FRAME_SIZE];
+ static uint32_t sweet_fb_secs;
++static uint32_t sweet_fb_slots = SWEET_FB_SLOTS_DEF;
+ static int sweet_fb_chan;
+ 
+ static void
+ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_FB_BLOCKS;
++	uint32_t slots = sweet_fb_slots;
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS -
++	    (uint64_t)slots * SWEET_FB_SLOT_BLOCKS;
+ 	uint64_t seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+@@ -946,7 +960,7 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 		uint32_t width = 0, height = 0, stride = 0;
+ 		uint64_t bytes = sweet_fb_frame_copy(sweet_fb_copy,
+ 		    sizeof(sweet_fb_copy), &width, &height, &stride);
+-		if (bytes == 0 || bytes > (uint64_t)SWEET_FB_BLOCKS * UFS_BLOCK - UFS_BLOCK) {
++		if (bytes == 0 || bytes > (uint64_t)SWEET_FB_SLOT_BLOCKS * UFS_BLOCK - UFS_BLOCK) {
+ 			printf("SWEET FBDUMP: disabled (no fb/ufs)\n");
+ 			return;
+ 		}
+@@ -957,6 +971,9 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 
+ 		sweet_fb_panel_info(&panel_phys, NULL, NULL, NULL,
+ 		    &present_calls, &layer_copies);
++		seq++;
++		uint64_t slot = seq % slots;
++		uint64_t slot_base = base + slot * SWEET_FB_SLOT_BLOCKS;
+ 
+ 		/* The frame first, then the header that stamps it as complete. */
+ 		lck_mtx_lock(&sweet_ufs_lock);
+@@ -969,7 +986,7 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 				bzero((char *)bounce + here, n * UFS_BLOCK - here);
+ 			}
+ 			memcpy(bounce, sweet_fb_copy + off, here);
+-			error = ufs_write_blocks(base + 1 + blk, n);
++			error = ufs_write_blocks(slot_base + 1 + blk, n);
+ 			blk += n;
+ 		}
+ 		if (!error) {
+@@ -977,14 +994,15 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 				.magic = { 'S', 'W', 'E', 'E', 'T', 'F', 'B', '0' },
+ 				.version = 1,
+ 				.width = width, .height = height, .stride = stride,
+-				.seq = ++seq, .dumps = seq,
++				.seq = seq, .dumps = seq,
+ 				.panel_phys = panel_phys,
+ 				.present_calls = present_calls,
+ 				.layer_copies = layer_copies,
++				.slots = slots, .slot = (uint32_t)slot,
+ 			};
+ 			bzero(bounce, UFS_BLOCK);
+ 			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
++			error = ufs_write_blocks(slot_base, 1);
+ 		}
+ 		if (!error) {
+ 			error = ufs_sync_cache();
+@@ -1009,14 +1027,22 @@ sweet_fb_dump_start(void)
+ {
+ 	thread_t thread;
+ 	uint32_t secs = 0;
++	uint32_t slots = SWEET_FB_SLOTS_DEF;
+ 
+ 	/* Default off: only a positive sweetfbdump boot-arg enables the dump. */
+ 	PE_parse_boot_argn("sweetfbdump", &secs, sizeof(secs));
+ 	if (secs == 0) {
+ 		return;
+ 	}
++	PE_parse_boot_argn("sweetfbdumpslots", &slots, sizeof(slots));
++	if (slots == 0) {
++		slots = SWEET_FB_SLOTS_DEF;
++	}
++	if (slots > SWEET_FB_SLOTS_MAX) {
++		slots = SWEET_FB_SLOTS_MAX;
++	}
+ 	if (!su.writable ||
+-	    su.nblocks < SWEET_LOG_BLOCKS + SWEET_FB_BLOCKS + 1) {
++	    su.nblocks < SWEET_LOG_BLOCKS + (uint64_t)slots * SWEET_FB_SLOT_BLOCKS + 1) {
+ 		printf("SWEET FBDUMP: disabled (no fb/ufs)\n");
+ 		return;
+ 	}
+@@ -1024,8 +1050,13 @@ sweet_fb_dump_start(void)
+ 		secs = SWEET_FB_MIN_SECS;
+ 	}
+ 	sweet_fb_secs = secs;
++	sweet_fb_slots = slots;
+ 	printf("SWEET FBDUMP: enabled every %d s, %d bytes/frame\n",
+ 	    (int)secs, (int)SWEET_FB_FRAME_SIZE);
++	printf("SWEET FBDUMP: slots=%u ring=%llu MiB at block 0x%llx (slot = seq %% slots)\n",
++	    slots, ((uint64_t)slots * SWEET_FB_SLOT_BLOCKS * UFS_BLOCK) >> 20,
++	    su.first_block + su.nblocks - SWEET_LOG_BLOCKS -
++	    (uint64_t)slots * SWEET_FB_SLOT_BLOCKS);
+ 	if (kernel_thread_start(sweet_fb_dump_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {

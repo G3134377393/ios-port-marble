@@ -1,0 +1,220 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 251d664..6954b5a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,10 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void sweet_fb_dump_start(void);
++/* iokit/Kernel/arm/SweetFramebuffer.cpp: copy the panel frame (framedump). */
++extern uint64_t sweet_fb_frame_copy(void *dst, uint64_t capacity,
++    uint32_t *width, uint32_t *height, uint32_t *stride);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -706,6 +710,7 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	sweet_fb_dump_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+@@ -887,6 +892,132 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++
++/*
++ * Panel frame dump ("sweetfbdump").  The only other way to see what the
++ * screen shows is a camera pointed at the phone: every sweetfbdump seconds
++ * copy the boot framebuffer the display driver presents into (through the
++ * driver's own mapping, see SweetFramebuffer.cpp) and write it to userdata
++ * in front of the persistent console log ring, so a recovery can dd it out.
++ *
++ * Layout, starting at block (partition end - log ring - 2533):
++ *   block 0            header: "SWEETFB0" | u32 version 1 | u32 width
++ *                      | u32 height | u32 stride | u64 seq | u64 dumps
++ *   blocks 1..2532     raw a8r8g8b8 pixels, stride x height bytes
++ *
++ * Off unless boot-arg sweetfbdump=N (>0, clamped to at least 2 s).
++ */
++#define SWEET_FB_WIDTH          1080u
++#define SWEET_FB_HEIGHT         2400u
++#define SWEET_FB_STRIDE         4320u
++#define SWEET_FB_FRAME_SIZE     (SWEET_FB_STRIDE * SWEET_FB_HEIGHT)     /* 10,368,000 */
++#define SWEET_FB_BLOCKS         2533u
++#define SWEET_FB_WARMUP_SECS    10u
++#define SWEET_FB_MIN_SECS       2u
++
++struct sweet_fb_header {
++	char magic[8];
++	uint32_t version;
++	uint32_t width, height, stride;
++	uint64_t seq;
++	uint64_t dumps;
++};
++
++static char sweet_fb_copy[SWEET_FB_FRAME_SIZE];
++static uint32_t sweet_fb_secs;
++static int sweet_fb_chan;
++
++static void
++sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_FB_BLOCKS;
++	uint64_t seq = 0;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++
++	/* Let the display driver and userland settle before the first dump. */
++	(void)tsleep(&sweet_fb_chan, PZERO, "sweetfbdump",
++	    hz * (int)SWEET_FB_WARMUP_SECS);
++	for (;;) {
++		uint32_t width = 0, height = 0, stride = 0;
++		uint64_t bytes = sweet_fb_frame_copy(sweet_fb_copy,
++		    sizeof(sweet_fb_copy), &width, &height, &stride);
++		if (bytes == 0 || bytes > (uint64_t)SWEET_FB_BLOCKS * UFS_BLOCK - UFS_BLOCK) {
++			printf("SWEET FBDUMP: disabled (no fb/ufs)\n");
++			return;
++		}
++		uint32_t blocks = (uint32_t)((bytes + UFS_BLOCK - 1) / UFS_BLOCK);
++		int error = 0;
++
++		/* The frame first, then the header that stamps it as complete. */
++		lck_mtx_lock(&sweet_ufs_lock);
++		for (uint32_t blk = 0; blk < blocks && !error; ) {
++			uint32_t n = MIN(blocks - blk,
++			    (uint32_t)(BOUNCE_SIZE / UFS_BLOCK));
++			uint64_t off = (uint64_t)blk * UFS_BLOCK;
++			uint32_t here = (uint32_t)MIN((uint64_t)n * UFS_BLOCK, bytes - off);
++			if (here < n * UFS_BLOCK) {
++				bzero((char *)bounce + here, n * UFS_BLOCK - here);
++			}
++			memcpy(bounce, sweet_fb_copy + off, here);
++			error = ufs_write_blocks(base + 1 + blk, n);
++			blk += n;
++		}
++		if (!error) {
++			struct sweet_fb_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'F', 'B', '0' },
++				.version = 1,
++				.width = width, .height = height, .stride = stride,
++				.seq = ++seq, .dumps = seq,
++			};
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_blocks(base, 1);
++		}
++		if (!error) {
++			error = ufs_sync_cache();
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (error) {
++			printf("SWEET FBDUMP: write failed (%d), stopping\n", error);
++			return;
++		}
++		if ((seq % 12) == 0) {
++			printf("SWEET FBDUMP: seq=%llu\n", seq);
++		}
++		(void)tsleep(&sweet_fb_chan, PZERO, "sweetfbdump",
++		    hz * (int)sweet_fb_secs);
++	}
++}
++
++static void
++sweet_fb_dump_start(void)
++{
++	thread_t thread;
++	uint32_t secs = 0;
++
++	/* Default off: only a positive sweetfbdump boot-arg enables the dump. */
++	PE_parse_boot_argn("sweetfbdump", &secs, sizeof(secs));
++	if (secs == 0) {
++		return;
++	}
++	if (!su.writable ||
++	    su.nblocks < SWEET_LOG_BLOCKS + SWEET_FB_BLOCKS + 1) {
++		printf("SWEET FBDUMP: disabled (no fb/ufs)\n");
++		return;
++	}
++	if (secs < SWEET_FB_MIN_SECS) {
++		secs = SWEET_FB_MIN_SECS;
++	}
++	sweet_fb_secs = secs;
++	printf("SWEET FBDUMP: enabled every %d s, %d bytes/frame\n",
++	    (int)secs, (int)SWEET_FB_FRAME_SIZE);
++	if (kernel_thread_start(sweet_fb_dump_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET FBDUMP: disabled (no fb/ufs)\n");
++	}
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..c736663 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -126,6 +126,9 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/* Panel instance, for the frame buffer dump thread (bsd/dev/sweet_ufs.c). */
++static AppleCLCD *sweet_fb_instance;
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -201,11 +204,49 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	sweet_fb_instance = this;
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
++/*
++ * SWEET FBDUMP: copy the current panel frame out for the kernel frame buffer
++ * dump thread (bsd/dev/sweet_ufs.c).  The copy is taken through the same
++ * mapping the driver's presents write through, so it sees exactly what is on
++ * the panel; a barrier makes sure in-flight writes have drained first.
++ * Returns the byte count, or 0 when there is no boot framebuffer (yet).
++ */
++extern "C" uint64_t
++sweet_fb_frame_copy(void *dst, uint64_t capacity, uint32_t *width, uint32_t *height,
++    uint32_t *stride)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++	uint64_t need;
++
++	if (fb == NULL || fb->fPixels == 0 || dst == NULL ||
++	    fb->fWidth == 0 || fb->fHeight == 0 || fb->fRowBytes < fb->fWidth * 4) {
++		return 0;
++	}
++	need = (uint64_t)fb->fRowBytes * (uint64_t)fb->fHeight;
++	if (need > capacity) {
++		return 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	memcpy(dst, (const void *)fb->fPixels, (size_t)need);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (width != NULL) {
++		*width = fb->fWidth;
++	}
++	if (height != NULL) {
++		*height = fb->fHeight;
++	}
++	if (stride != NULL) {
++		*stride = fb->fRowBytes;
++	}
++	return need;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {

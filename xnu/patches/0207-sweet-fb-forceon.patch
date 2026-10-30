@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 496e37d..091cad7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -121,6 +121,7 @@ public:
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
++	bool          fForceOn;       /* boot-arg sweetfbforceon: ignore power off */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -223,6 +224,12 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	uint32_t forceon = 0;
++	PE_parse_boot_argn("sweetfbforceon", &forceon, sizeof(forceon));
++	fForceOn = forceon != 0;
++	if (fForceOn) {
++		IOLog("SWEET FB: force-on enabled, ignoring power-off\n");
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -648,7 +655,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+-			bool off = args->scalarInput[0] == 0;
++			uint32_t state = (uint32_t)args->scalarInput[0];
++			bool off = state == 0;
++			IOLog("SWEET FB: power change state=%u\n", state);
++			if (off && fFB->fForceOn) {
++				IOLog("SWEET FB: force-on enabled, ignoring power-off\n");
++				break;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;

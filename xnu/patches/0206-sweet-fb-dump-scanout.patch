@@ -1,0 +1,208 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6954b5a..c53a2e1 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -58,6 +58,8 @@ static void sweet_fb_dump_start(void);
+ /* iokit/Kernel/arm/SweetFramebuffer.cpp: copy the panel frame (framedump). */
+ extern uint64_t sweet_fb_frame_copy(void *dst, uint64_t capacity,
+     uint32_t *width, uint32_t *height, uint32_t *stride);
++extern void sweet_fb_panel_info(uint64_t *phys, uint32_t *width, uint32_t *height,
++    uint32_t *stride, uint64_t *present_calls, uint64_t *layer_copies);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -921,6 +923,9 @@ struct sweet_fb_header {
+ 	uint32_t width, height, stride;
+ 	uint64_t seq;
+ 	uint64_t dumps;
++	uint64_t panel_phys;
++	uint64_t present_calls;
++	uint64_t layer_copies;
+ };
+ 
+ static char sweet_fb_copy[SWEET_FB_FRAME_SIZE];
+@@ -948,6 +953,11 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 		uint32_t blocks = (uint32_t)((bytes + UFS_BLOCK - 1) / UFS_BLOCK);
+ 		int error = 0;
+ 
++		uint64_t panel_phys = 0, present_calls = 0, layer_copies = 0;
++
++		sweet_fb_panel_info(&panel_phys, NULL, NULL, NULL,
++		    &present_calls, &layer_copies);
++
+ 		/* The frame first, then the header that stamps it as complete. */
+ 		lck_mtx_lock(&sweet_ufs_lock);
+ 		for (uint32_t blk = 0; blk < blocks && !error; ) {
+@@ -968,6 +978,9 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 				.version = 1,
+ 				.width = width, .height = height, .stride = stride,
+ 				.seq = ++seq, .dumps = seq,
++				.panel_phys = panel_phys,
++				.present_calls = present_calls,
++				.layer_copies = layer_copies,
+ 			};
+ 			bzero(bounce, UFS_BLOCK);
+ 			memcpy(bounce, &h, sizeof(h));
+@@ -983,6 +996,8 @@ sweet_fb_dump_thread(__unused void *arg, __unused wait_result_t wr)
+ 		}
+ 		if ((seq % 12) == 0) {
+ 			printf("SWEET FBDUMP: seq=%llu\n", seq);
++			printf("SWEET FBDUMP: presents=%llu copies=%llu phys=0x%llx\n",
++			    present_calls, layer_copies, panel_phys);
+ 		}
+ 		(void)tsleep(&sweet_fb_chan, PZERO, "sweetfbdump",
+ 		    hz * (int)sweet_fb_secs);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c736663..496e37d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,6 +44,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+@@ -110,6 +111,11 @@ public:
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
++	uintptr_t     fDumpPixels;        /* second mapping of the panel memory, for the dump */
++	IOMemoryMap  *fDumpMap;
++	uint64_t     fPresentCalls;      /* SwapEnd records composited */
++	uint64_t     fLayerCopies;       /* layers actually copied to the panel */
++	uint32_t     fNoLayerRecords;    /* records with no enabled layer */
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+@@ -183,6 +189,25 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/*
++	 * SWEET FBDUMP: a second mapping of the same panel memory the presents
++	 * write (the scanout buffer), used only by the frame buffer dump thread.
++	 * Reading through the driver's own present path keeps the dump pixels
++	 * identical to what the display controller scans out.
++	 */
++	if (fSurface != NULL) {
++		uint64_t bytes = (uint64_t)fRowBytes * fHeight;
++		IOMemoryDescriptor *panel = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    (IOByteCount)((bytes + 0x3FFF) & ~(uint64_t)0x3FFF), kIODirectionInOut);
++		if (panel != NULL) {
++			fDumpMap = panel->map(kIOMapWriteCombineCache);
++			panel->release();
++		}
++		fDumpPixels = fDumpMap != NULL ? (uintptr_t)fDumpMap->getVirtualAddress() : fPixels;
++	}
++	fPresentCalls = 0;
++	fLayerCopies = 0;
++	fNoLayerRecords = 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -223,17 +248,22 @@ sweet_fb_frame_copy(void *dst, uint64_t capacity, uint32_t *width, uint32_t *hei
+ {
+ 	AppleCLCD *fb = sweet_fb_instance;
+ 	uint64_t need;
++	uintptr_t panel;
+ 
+-	if (fb == NULL || fb->fPixels == 0 || dst == NULL ||
+-	    fb->fWidth == 0 || fb->fHeight == 0 || fb->fRowBytes < fb->fWidth * 4) {
++	if (fb == NULL || dst == NULL || fb->fWidth == 0 || fb->fHeight == 0 ||
++	    fb->fRowBytes < fb->fWidth * 4) {
+ 		return 0;
+ 	}
+ 	need = (uint64_t)fb->fRowBytes * (uint64_t)fb->fHeight;
+ 	if (need > capacity) {
+ 		return 0;
+ 	}
++	panel = fb->fDumpPixels != 0 ? fb->fDumpPixels : fb->fPixels;
++	if (panel == 0) {
++		return 0;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	memcpy(dst, (const void *)fb->fPixels, (size_t)need);
++	memcpy(dst, (const void *)panel, (size_t)need);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	if (width != NULL) {
+ 		*width = fb->fWidth;
+@@ -247,6 +277,33 @@ sweet_fb_frame_copy(void *dst, uint64_t capacity, uint32_t *width, uint32_t *hei
+ 	return need;
+ }
+ 
++/* Panel memory + present accounting, for the dump header and console log. */
++extern "C" void
++sweet_fb_panel_info(uint64_t *phys, uint32_t *width, uint32_t *height, uint32_t *stride,
++    uint64_t *present_calls, uint64_t *layer_copies)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++
++	if (phys != NULL) {
++		*phys = fb != NULL ? fb->fPhys : 0;
++	}
++	if (width != NULL) {
++		*width = fb != NULL ? fb->fWidth : 0;
++	}
++	if (height != NULL) {
++		*height = fb != NULL ? fb->fHeight : 0;
++	}
++	if (stride != NULL) {
++		*stride = fb != NULL ? fb->fRowBytes : 0;
++	}
++	if (present_calls != NULL) {
++		*present_calls = fb != NULL ? fb->fPresentCalls : 0;
++	}
++	if (layer_copies != NULL) {
++		*layer_copies = fb != NULL ? fb->fLayerCopies : 0;
++	}
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -354,6 +411,8 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	fPresentCalls++;
++
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -365,6 +424,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	uint32_t copied_here = 0;
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -432,6 +493,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			fLayerCopies++;
++			copied_here++;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -440,6 +503,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (copied_here == 0 && fPresentCalls > 0) {
++		if (fNoLayerRecords < 4) {
++			fNoLayerRecords++;
++			/* A record that names no enabled layer cannot be shown. */
++			IOLog("SWEET FB: present %llu with no enabled layer (mask=0x%x)\n",
++			    fPresentCalls, mask);
++		}
++	} else if (fLayerCopies == (uint64_t)copied_here) {
++		IOLog("SWEET FB: first layer copy to panel done (%u layers)\n", copied_here);
++	}
+ }
+ 
+ bool
